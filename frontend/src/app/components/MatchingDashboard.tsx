@@ -1,6 +1,16 @@
-import { Button } from "../../app/components/ui/button";
-import { Badge } from "../../app/components/ui/badge";
-import { Label } from "../../app/components/ui/label";
+import {
+  AlertCircle,
+  AlertTriangle,
+  CheckCircle,
+  Clock,
+  Loader2,
+  Target,
+  Users,
+  UserX,
+  XCircle,
+} from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -11,24 +21,30 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "../../app/components/ui/alert-dialog";
-import {
-  Users,
-  Clock,
-  CheckCircle,
-  XCircle,
-  Loader2,
-  AlertCircle,
-  Target,
-  AlertTriangle,
-  UserX,
-} from "lucide-react";
-import { useState, useEffect, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { Badge } from "../../app/components/ui/badge";
+import { Button } from "../../app/components/ui/button";
+import { Label } from "../../app/components/ui/label";
+import { getTopics } from "../services/questionService";
 
-type MatchingState = "idle" | "searching" | "matched" | "timeout" | "abandoned";
+type MatchingState =
+  | "idle"
+  | "searching"
+  | "matched"
+  | "timeout"
+  | "abandoned"
+  | "pendingAcceptTimeoutNotice";
 
 interface MatchInfo {
   roomId: string;
+  users: [string, string];
+  createdAt: number;
+  topic: string;
+  difficulty: string;
+  language: string;
+}
+
+interface PendingMatchInfo {
+  pendingMatchId: string;
   users: [string, string];
   createdAt: number;
   topic: string;
@@ -40,30 +56,62 @@ interface MatchingDashboardProps {
   onMatchingStateChange?: (isSearching: boolean) => void;
 }
 
+const MATCH_ACCEPT_TIMEOUT_SECONDS = 15;
+const TOPIC_MAP: Record<string, string> = {
+  "Algorithms": "algorithms",
+  "Data Structures": "data-structures",
+  "Dynamic Programming": "dynamic-programming",
+  "Graphs": "graphs",
+  "Trees": "trees",
+  "Arrays": "arrays",
+  "Strings": "strings",
+  "System Design": "system-design",
+  "Linked Lists": "linked-lists",
+};
+
+const normalizeTopicForMatching = (topic: string) =>
+  TOPIC_MAP[topic] ||
+  topic
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
 export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardProps) {
   const [selectedDifficulty, setSelectedDifficulty] = useState<string>("Medium");
-  const [selectedTopic, setSelectedTopic] = useState<string>("Algorithms");
+  const [selectedTopic, setSelectedTopic] = useState<string>("");
   const [selectedLanguage, setSelectedLanguage] = useState<string>("JavaScript");
+  const [availableTopics, setAvailableTopics] = useState<string[]>([]);
+  const [isLoadingTopics, setIsLoadingTopics] = useState(true);
+  const [topicsError, setTopicsError] = useState("");
   const [matchingState, setMatchingState] = useState<MatchingState>("idle");
   const [timeRemaining, setTimeRemaining] = useState(30);
   const [showWarning, setShowWarning] = useState(false);
   const [matchData, setMatchData] = useState<MatchInfo | null>(null);
+  const [pendingMatchData, setPendingMatchData] = useState<PendingMatchInfo | null>(null);
+  const [currentUserId, setCurrentUserId] = useState<string>("");
+  const [hasAcceptedMatch, setHasAcceptedMatch] = useState(false);
+  const [matchAcceptTimeRemaining, setMatchAcceptTimeRemaining] = useState(MATCH_ACCEPT_TIMEOUT_SECONDS);
+  const [pendingAcceptTimeoutSeconds, setPendingAcceptTimeoutSeconds] = useState(5);
+  const [pendingAcceptTimeoutReason, setPendingAcceptTimeoutReason] = useState("");
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [showAbandonConfirm, setShowAbandonConfirm] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const hasAcceptedMatchRef = useRef(false); // cannot use useState as websocket will capture the value on websocket creation. updates to the state will not be reflected by WS
+
+  const resetToIdleAfterPendingTimeoutNotice = () => {
+    setMatchingState("idle");
+    setMatchData(null);
+    setPendingMatchData(null);
+    setHasAcceptedMatch(false);
+    setPendingAcceptTimeoutSeconds(5);
+    setPendingAcceptTimeoutReason("");
+    setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
+    setTimeRemaining(30);
+    setShowWarning(false);
+  };
 
   const difficulties = ["Easy", "Medium", "Hard"];
-  const topics = [
-    "Algorithms",
-    "Data Structures",
-    "Dynamic Programming",
-    "Graphs",
-    "Trees",
-    "Arrays",
-    "Strings",
-    "System Design",
-    "Linked Lists",
-  ];
   const languages = [
     "JavaScript",
     "Python",
@@ -74,19 +122,6 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     "Ruby",
     "C#",
   ];
-
-  // Map display names to backend enum values
-  const topicMap: Record<string, string> = {
-    "Algorithms": "algorithms",
-    "Data Structures": "data-structures",
-    "Dynamic Programming": "dynamic-programming",
-    "Graphs": "graphs",
-    "Trees": "trees",
-    "Arrays": "arrays",
-    "Strings": "strings",
-    "System Design": "system-design",
-    "Linked Lists": "linked-lists",
-  };
 
   const languageMap: Record<string, string> = {
     "JavaScript": "javascript",
@@ -100,6 +135,11 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
   };
 
   const handleStartMatching = () => {
+    if (!selectedTopic) {
+      setErrorMessage("Please select a topic before starting matching.");
+      return;
+    }
+
     // Close any stale WebSocket from a previous attempt
     if (wsRef.current) {
       wsRef.current.close();
@@ -109,7 +149,13 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     setMatchingState("searching");
     setTimeRemaining(30);
     setShowWarning(false);
+    setMatchData(null);
+    setPendingMatchData(null);
+    setHasAcceptedMatch(false);
     setErrorMessage("");
+    setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
+    setPendingAcceptTimeoutSeconds(5);
+    setPendingAcceptTimeoutReason("");
 
     const token = localStorage.getItem("token");
     let userId = "";
@@ -128,6 +174,8 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
       return;
     }
 
+    setCurrentUserId(userId);
+
     const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:3004/api";
     // Derive WS URL from the API URL: http(s)://host:port/api -> ws(s)://host:port/ws/match
     const baseUrl = apiUrl.replace(/\/api\/?$/, "");
@@ -139,7 +187,7 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     ws.onopen = () => {
       ws.send(JSON.stringify({
         type: "enqueue",
-        topic: topicMap[selectedTopic] || selectedTopic.toLowerCase(),
+        topic: normalizeTopicForMatching(selectedTopic),
         difficulty: selectedDifficulty.toLowerCase(),
         language: languageMap[selectedLanguage] || selectedLanguage.toLowerCase(),
       }));
@@ -155,12 +203,42 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
 
       if (msg.type === "queued") {
         // Already showing "searching" state
+      } else if (msg.type === "match_pending") {
+        const pendingMatch = msg.pendingMatch as PendingMatchInfo;
+        const remainingTime = Math.max(
+          0,
+          MATCH_ACCEPT_TIMEOUT_SECONDS - Math.floor((Date.now() - pendingMatch.createdAt) / 1000),
+        );
+        setMatchingState("matched");
+        setPendingMatchData(pendingMatch);
+        setHasAcceptedMatch(false);
+        setMatchAcceptTimeRemaining(remainingTime);
+      } else if (msg.type === "match_confirmed") {
+        const confirmedMatch = msg.match as MatchInfo;
+        setMatchData(confirmedMatch);
+        setPendingMatchData(null);
+        setHasAcceptedMatch(false);
+        setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
+        localStorage.setItem("roomId", confirmedMatch.roomId);
+        navigate(`/collaboration?roomId=${encodeURIComponent(confirmedMatch.roomId)}`);
       } else if (msg.type === "matched") {
         setMatchingState("matched");
         console.log("Match found:", msg.match);
-        setMatchData(msg.match as MatchInfo);
+        const confirmedMatch = msg.match as MatchInfo;
+        setMatchData(confirmedMatch);
+        setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
+        localStorage.setItem("roomId", confirmedMatch.roomId);
+        navigate(`/collaboration?roomId=${encodeURIComponent(confirmedMatch.roomId)}`);
       } else if (msg.type === "timeout") {
         setMatchingState("timeout");
+      } else if (msg.type === "pending_accept_timeout") {
+        const timeoutReason = hasAcceptedMatchRef.current
+          ? "The user you were matched with did not accept in time."
+          : "You did not accept the match in time.";
+        setPendingAcceptTimeoutReason(timeoutReason);
+        setPendingAcceptTimeoutSeconds(5);
+        setErrorMessage("");
+        setMatchingState("pendingAcceptTimeoutNotice");
       } else if (msg.type === "match_abandoned") {
         setMatchingState("abandoned");
       } else if (msg.type === "error") {
@@ -199,11 +277,12 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     setTimeRemaining(30);
     setShowWarning(false);
     setMatchData(null);
+    setPendingMatchData(null);
+    setHasAcceptedMatch(false);
+    setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
+    setPendingAcceptTimeoutSeconds(5);
+    setPendingAcceptTimeoutReason("");
     setErrorMessage("");
-  };
-
-  const handleFindAnotherMatch = () => {
-    setShowAbandonConfirm(true);
   };
 
   const confirmAbandon = () => {
@@ -216,6 +295,11 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     wsRef.current = null;
     setMatchingState("idle");
     setMatchData(null);
+    setPendingMatchData(null);
+    setHasAcceptedMatch(false);
+    setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
+    setPendingAcceptTimeoutSeconds(5);
+    setPendingAcceptTimeoutReason("");
   };
 
   const navigate = useNavigate();
@@ -227,13 +311,91 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     navigate(`/collaboration?roomId=${encodeURIComponent(storedRoomId)}`);
   }, [navigate]);
 
+  useEffect(() => {
+    let isCancelled = false;
+
+    const fetchAvailableTopics = async () => {
+      setIsLoadingTopics(true);
+      setTopicsError("");
+
+      try {
+        const data = await getTopics();
+        if (isCancelled) {
+          return;
+        }
+
+        setAvailableTopics(data.topics);
+        setSelectedTopic((currentTopic) => {
+          if (currentTopic && data.topics.includes(currentTopic)) {
+            return currentTopic;
+          }
+
+          return data.topics[0] ?? "";
+        });
+
+        if (data.topics.length === 0) {
+          setTopicsError("No topics are currently available.");
+        }
+      } catch (err: any) {
+        if (isCancelled) {
+          return;
+        }
+
+        setAvailableTopics([]);
+        setSelectedTopic("");
+        setTopicsError(err.response?.data?.error || "Failed to load topics");
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingTopics(false);
+        }
+      }
+    };
+
+    fetchAvailableTopics();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
   const navigateToCollaboration = () => {
-    const targetRoomId = matchData?.roomId || localStorage.getItem("roomId");
+    if (pendingMatchData) {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        setErrorMessage("Matching connection is closed. Please retry.");
+        setMatchingState("idle");
+        setPendingMatchData(null);
+        setHasAcceptedMatch(false);
+        setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
+        return;
+      }
+
+      if (hasAcceptedMatch) {
+        return;
+      }
+
+      wsRef.current.send(JSON.stringify({
+        type: "accept_match",
+        pendingMatchId: pendingMatchData.pendingMatchId,
+      }));
+      setHasAcceptedMatch(true);
+      hasAcceptedMatchRef.current = true;
+      return;
+    }
+
+    const targetRoomId = matchData?.roomId;
     if (!targetRoomId) return;
 
     localStorage.setItem("roomId", targetRoomId);
     navigate(`/collaboration?roomId=${encodeURIComponent(targetRoomId)}`);
   }
+
+  const matchedUsers = pendingMatchData?.users ?? matchData?.users ?? null;
+  const matchedPeerId = matchedUsers
+    ? matchedUsers.find((userId) => userId !== currentUserId) ?? matchedUsers[0]
+    : "";
+  const matchedDifficulty = pendingMatchData?.difficulty;
+  const matchedTopic = pendingMatchData?.topic;
+  const matchedLanguage = pendingMatchData?.language;
 
   // Cleanup WebSocket on unmount
   useEffect(() => {
@@ -243,6 +405,10 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
   }, []);
 
   // Client-side countdown timer for display
+  useEffect(() => {
+    hasAcceptedMatchRef.current = hasAcceptedMatch;
+  }, [hasAcceptedMatch]);
+
   useEffect(() => {
     if (matchingState !== "searching") return;
     const timer = setInterval(() => {
@@ -263,6 +429,37 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     }, 1000);
     return () => clearInterval(timer);
   }, [matchingState]);
+
+  useEffect(() => {
+    if (matchingState !== "matched" || !pendingMatchData) return;
+
+    const updateRemainingTime = () => {
+      const remainingTime = Math.max(
+        0,
+        MATCH_ACCEPT_TIMEOUT_SECONDS - Math.floor((Date.now() - pendingMatchData.createdAt) / 1000),
+      );
+      setMatchAcceptTimeRemaining(remainingTime);
+    };
+
+    updateRemainingTime();
+    const timer = window.setInterval(updateRemainingTime, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [matchingState, pendingMatchData]);
+
+  useEffect(() => {
+    if (matchingState !== "pendingAcceptTimeoutNotice") return;
+
+    const timeoutId = window.setTimeout(() => {
+      if (pendingAcceptTimeoutSeconds <= 1) {
+        resetToIdleAfterPendingTimeoutNotice();
+        return;
+      }
+      setPendingAcceptTimeoutSeconds((previousSeconds) => previousSeconds - 1);
+    }, 1000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [matchingState, pendingAcceptTimeoutSeconds]);
 
   // Notify parent when matching state changes
   useEffect(() => {
@@ -344,26 +541,36 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
               <Label className="text-gray-700 text-base">
                 Topic
               </Label>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                {topics.map((topic) => (
-                  <button
-                    key={topic}
-                    onClick={() => setSelectedTopic(topic)}
-                    className={`p-3 border-3 rounded-lg font-medium text-sm transition-all relative ${
-                      selectedTopic === topic
-                        ? "border-blue-600 bg-blue-50 text-blue-700"
-                        : "border-gray-300 bg-white text-gray-700 hover:border-gray-400"
-                    }`}
-                  >
-                    {selectedTopic === topic && (
-                      <div className="absolute top-1 right-1 w-4 h-4 bg-blue-600 rounded-full flex items-center justify-center">
-                        <CheckCircle className="w-3 h-3 text-white" />
-                      </div>
-                    )}
-                    {topic}
-                  </button>
-                ))}
-              </div>
+              {isLoadingTopics ? (
+                <div className="rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-4 text-sm text-gray-600">
+                  Loading available topics...
+                </div>
+              ) : availableTopics.length > 0 ? (
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {availableTopics.map((topic) => (
+                    <button
+                      key={topic}
+                      onClick={() => setSelectedTopic(topic)}
+                      className={`p-3 border-3 rounded-lg font-medium text-sm transition-all relative ${
+                        selectedTopic === topic
+                          ? "border-blue-600 bg-blue-50 text-blue-700"
+                          : "border-gray-300 bg-white text-gray-700 hover:border-gray-400"
+                      }`}
+                    >
+                      {selectedTopic === topic && (
+                        <div className="absolute top-1 right-1 w-4 h-4 bg-blue-600 rounded-full flex items-center justify-center">
+                          <CheckCircle className="w-3 h-3 text-white" />
+                        </div>
+                      )}
+                      {topic}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-lg border-2 border-red-200 bg-red-50 p-4 text-sm text-red-700">
+                  {topicsError || "No topics available for matching right now."}
+                </div>
+              )}
             </div>
 
             {/* Language Selection */}
@@ -401,7 +608,7 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
                   {selectedDifficulty}
                 </Badge>
                 <Badge className="bg-purple-600 text-white px-3 py-1">
-                  {selectedTopic}
+                  {selectedTopic || "No topic available"}
                 </Badge>
                 <Badge className="bg-green-600 text-white px-3 py-1">
                   {selectedLanguage}
@@ -410,21 +617,22 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
             </div>
 
             {/* Start Matching Button */}
-            <Button 
+            <Button
               onClick={handleStartMatching}
+              disabled={isLoadingTopics || availableTopics.length === 0 || !selectedTopic}
               className="w-full bg-blue-600 hover:bg-blue-700 text-white h-12 text-base"
             >
               <Users className="mr-2 h-5 w-5" />
-              Start Matching
+              {isLoadingTopics ? "Loading Topics..." : "Start Matching"}
             </Button>
 
             {/* Warning/Error Message */}
-            {errorMessage && (
+            {(errorMessage || topicsError) && (
               <div className="p-4 bg-red-50 border-2 border-red-200 rounded-lg mt-4">
                 <div className="flex items-start gap-2 text-sm text-red-800">
                   <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5" />
                   <div className="text-left">
-                    {errorMessage}
+                    {errorMessage || topicsError}
                   </div>
                 </div>
               </div>
@@ -447,12 +655,12 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
               <div className="w-24 h-24 mx-auto bg-blue-100 rounded-full flex items-center justify-center">
                 <Loader2 className="w-12 h-12 text-blue-600 animate-spin" />
               </div>
-              
+
               <div className="space-y-2">
                 <h2 className="text-2xl font-semibold text-gray-800">
                   Finding Your Match...
                 </h2>
-                
+
                 <p className="text-gray-600">
                   Searching for another user with the same preferences
                 </p>
@@ -471,6 +679,14 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
                 </Badge>
               </div>
 
+              {/* Progress Indicator */}
+              <div className="pt-4">
+                <div className="flex items-center justify-center gap-2 text-sm text-gray-600">
+                  <div className="w-2 h-2 bg-blue-600 rounded-full animate-pulse" />
+                  <span>Looking for available users...</span>
+                </div>
+              </div>
+
               {/* Users in Queue Info */}
               <div className="p-4 bg-blue-50 border-2 border-blue-200 rounded-lg">
                 <div className="flex items-center justify-center gap-3">
@@ -483,14 +699,6 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
                       You'll be matched when someone joins with the same preferences
                     </div>
                   </div>
-                </div>
-              </div>
-
-              {/* Progress Indicator */}
-              <div className="pt-4">
-                <div className="flex items-center justify-center gap-2 text-sm text-gray-600">
-                  <div className="w-2 h-2 bg-blue-600 rounded-full animate-pulse" />
-                  <span>Looking for available users...</span>
                 </div>
               </div>
             </div>
@@ -509,7 +717,7 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
             )}
 
             {/* Cancel Button */}
-            <Button 
+            <Button
               onClick={handleCancelMatching}
               variant="outline"
               className="w-full border-2 border-gray-300 h-11"
@@ -522,15 +730,22 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
         {/* Matched State */}
         {matchingState === "matched" && (
           <div className="border-4 border-green-300 rounded-lg p-8 bg-white space-y-6">
+            <div className="flex justify-end -mt-4 -mr-4 mb-2">
+              <div className="bg-orange-500 text-white px-4 py-2 rounded-bl-lg rounded-tr-lg flex items-center gap-2">
+                <Clock className="w-4 h-4" />
+                <span className="font-semibold">Both users have to accept in {matchAcceptTimeRemaining}s</span>
+              </div>
+            </div>
+
             <div className="text-center space-y-4">
               <div className="w-20 h-20 mx-auto bg-green-100 rounded-full flex items-center justify-center">
                 <CheckCircle className="w-10 h-10 text-green-600" />
               </div>
-              
+
               <h2 className="text-2xl font-semibold text-gray-800">
                 Match Found!
               </h2>
-              
+
               <p className="text-gray-600">
                 You've been matched with another user
               </p>
@@ -543,21 +758,21 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
                   </div>
                   <div className="text-left">
                     <div className="font-semibold text-gray-900 text-lg">
-                      Anonymous User #2847
+                      {matchedPeerId || "Matched User"}
                     </div>
                     <div className="text-sm text-gray-600">Online now</div>
                   </div>
                 </div>
 
                 <div className="flex gap-3 flex-wrap justify-center">
-                  <Badge className="bg-blue-600 text-white px-3 py-1">
-                    {selectedDifficulty}
+                  <Badge className="bg-blue-600 text-white px-3 py-1 capitalize">
+                    {matchedDifficulty}
                   </Badge>
-                  <Badge className="bg-purple-600 text-white px-3 py-1">
-                    {selectedTopic}
+                  <Badge className="bg-purple-600 text-white px-3 py-1 capitalize">
+                    {matchedTopic}
                   </Badge>
-                  <Badge className="bg-green-600 text-white px-3 py-1">
-                    {selectedLanguage}
+                  <Badge className="bg-green-600 text-white px-3 py-1 capitalize">
+                    {matchedLanguage}
                   </Badge>
                 </div>
               </div>
@@ -567,7 +782,11 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
                 <div className="flex items-start gap-2 text-sm text-blue-800">
                   <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
                   <div className="text-left">
-                    You will now be redirected to a collaborative workspace with an appropriate question
+                    {hasAcceptedMatch
+                      ? "Acceptance sent. Waiting for your peer to accept before navigation."
+                      : "Both users must click accept before automatic navigation to the collaborative workspace."}
+                    <br />
+                    This match will expire if both users do not accept in time.
                   </div>
                 </div>
               </div>
@@ -575,19 +794,13 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
 
             {/* Action Buttons */}
             <div className="space-y-3">
-              <Button 
+              <Button
                 onClick={navigateToCollaboration}
-                className="w-full bg-green-600 hover:bg-green-700 text-white h-12 text-base"
+                disabled={hasAcceptedMatch}
+                className="w-full bg-green-600 hover:bg-green-700 text-white h-12 text-base disabled:bg-green-300"
               >
                 <CheckCircle className="mr-2 h-5 w-5" />
-                Continue to Workspace
-              </Button>
-              <Button 
-                onClick={handleFindAnotherMatch}
-                variant="outline"
-                className="w-full border-2 border-gray-300 h-11"
-              >
-                Find Another Match
+                {hasAcceptedMatch ? "Waiting for Peer Acceptance..." : "Accept Match"}
               </Button>
             </div>
           </div>
@@ -600,11 +813,11 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
               <div className="w-20 h-20 mx-auto bg-orange-100 rounded-full flex items-center justify-center">
                 <UserX className="w-10 h-10 text-orange-600" />
               </div>
-              
+
               <h2 className="text-2xl font-semibold text-gray-800">
                 Match Abandoned
               </h2>
-              
+
               <p className="text-gray-600">
                 Your match partner has left and is looking for a new match.
               </p>
@@ -619,11 +832,43 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
               </div>
             </div>
 
-            <Button 
+            <Button
               onClick={handleRetry}
               className="w-full bg-blue-600 hover:bg-blue-700 text-white h-12 text-base"
             >
               Find a New Match
+            </Button>
+          </div>
+        )}
+
+        {/* Pending Accept Timeout Notice */}
+        {matchingState === "pendingAcceptTimeoutNotice" && (
+          <div className="border-4 border-orange-300 rounded-lg p-8 bg-white space-y-6">
+            <div className="text-center space-y-4">
+              <div className="w-20 h-20 mx-auto bg-orange-100 rounded-full flex items-center justify-center">
+                <Clock className="w-10 h-10 text-orange-600" />
+              </div>
+
+              <h2 className="text-2xl font-semibold text-gray-800">
+                Match Acceptance Timed Out
+              </h2>
+
+              <p className="text-gray-600">
+                {pendingAcceptTimeoutReason}
+              </p>
+
+              <div className="p-4 bg-orange-50 border-2 border-orange-200 rounded-lg">
+                <div className="text-sm text-orange-800">
+                  Redirecting to match criteria selection in <span className="font-bold">{pendingAcceptTimeoutSeconds}s</span>
+                </div>
+              </div>
+            </div>
+
+            <Button
+              onClick={resetToIdleAfterPendingTimeoutNotice}
+              className="w-full bg-blue-600 hover:bg-blue-700 text-white h-12 text-base"
+            >
+              Return Now
             </Button>
           </div>
         )}
@@ -635,11 +880,11 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
               <div className="w-20 h-20 mx-auto bg-red-100 rounded-full flex items-center justify-center">
                 <XCircle className="w-10 h-10 text-red-600" />
               </div>
-              
+
               <h2 className="text-2xl font-semibold text-gray-800">
                 Matching Timeout
               </h2>
-              
+
               <p className="text-gray-600">
                 No match found within the time limit
               </p>
@@ -679,7 +924,7 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
             </div>
 
             {/* Retry Button */}
-            <Button 
+            <Button
               onClick={handleRetry}
               className="w-full bg-blue-600 hover:bg-blue-700 text-white h-12 text-base"
             >

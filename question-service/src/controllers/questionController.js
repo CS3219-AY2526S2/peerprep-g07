@@ -1,6 +1,10 @@
 import pool from '../db/index.js';
 import { uploadImage, deleteImages } from '../services/s3Service.js';
 
+const VALID_DIFFICULTIES = ['Easy', 'Medium', 'Hard'];
+const DEFAULT_QUESTION_PAGE_SIZE = 12;
+const MAX_QUESTION_PAGE_SIZE = 100;
+
 // ────────────────────────────────────────────────────────────
 // Helper: map DB row → clean API response object
 // ────────────────────────────────────────────────────────────
@@ -17,6 +21,22 @@ const formatQuestion = (row) => ({
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
+
+const buildQuestionResponse = (question) => {
+  const missingAssets = question.imageUrls.filter((url) => !url || url.trim() === '');
+  const response = { question };
+
+  if (missingAssets.length > 0) {
+    response.assetWarning = `${missingAssets.length} image URL(s) are empty or unavailable.`;
+  }
+
+  return response;
+};
+
+const parsePositiveInteger = (value, fallback) => {
+  const parsed = parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
 
 // ────────────────────────────────────────────────────────────
 // Helper: validate and upload image files to S3
@@ -81,11 +101,10 @@ const createQuestion = async (req, res) => {
   }
 
   // Validate difficulty enum
-  const validDifficulties = ['Easy', 'Medium', 'Hard'];
-  if (!validDifficulties.includes(difficulty)) {
+  if (!VALID_DIFFICULTIES.includes(difficulty)) {
     return res.status(400).json({
       error: 'Validation Error',
-      message: `difficulty must be one of: ${validDifficulties.join(', ')}`,
+      message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
     });
   }
 
@@ -132,16 +151,19 @@ const createQuestion = async (req, res) => {
 // ────────────────────────────────────────────────────────────
 const getQuestions = async (req, res) => {
   const { topics, difficulty } = req.query;
+  const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+  const requestedPage = parsePositiveInteger(req.query.page, 1);
+  const requestedPageSize = parsePositiveInteger(req.query.pageSize, DEFAULT_QUESTION_PAGE_SIZE);
+  const pageSize = Math.min(requestedPageSize, MAX_QUESTION_PAGE_SIZE);
 
   const conditions = [];
   const params = [];
 
   if (difficulty) {
-    const validDifficulties = ['Easy', 'Medium', 'Hard'];
-    if (!validDifficulties.includes(difficulty)) {
+    if (!VALID_DIFFICULTIES.includes(difficulty)) {
       return res.status(400).json({
         error: 'Validation Error',
-        message: `difficulty must be one of: ${validDifficulties.join(', ')}`,
+        message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
       });
     }
     params.push(difficulty);
@@ -154,12 +176,33 @@ const getQuestions = async (req, res) => {
     conditions.push(`topics && $${params.length}::text[]`);
   }
 
+  if (search) {
+    params.push(`%${search}%`);
+    conditions.push(
+      `(title ILIKE $${params.length} OR description ILIKE $${params.length} OR array_to_string(topics, ' ') ILIKE $${params.length})`
+    );
+  }
+
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
   try {
-    const result = await pool.query(
-      `SELECT * FROM questions ${whereClause} ORDER BY question_id ASC`,
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM questions ${whereClause}`,
       params
+    );
+    const totalCount = countResult.rows[0]?.total || 0;
+    const totalPages = totalCount > 0 ? Math.ceil(totalCount / pageSize) : 0;
+    const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
+    const offset = (page - 1) * pageSize;
+
+    const queryParams = [...params, pageSize, offset];
+    const result = await pool.query(
+      `SELECT * FROM questions
+       ${whereClause}
+       ORDER BY question_id ASC
+       LIMIT $${queryParams.length - 1}
+       OFFSET $${queryParams.length}`,
+      queryParams
     );
 
     // Return all assets; note missing image URLs in response
@@ -177,10 +220,87 @@ const getQuestions = async (req, res) => {
 
     return res.status(200).json({
       count: questionsWithAssetStatus.length,
+      totalCount,
+      page,
+      pageSize,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPreviousPage: page > 1,
       questions: questionsWithAssetStatus,
     });
   } catch (err) {
     console.error('[getQuestions]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+const getRandomQuestion = async (req, res) => {
+  const topic = typeof req.query.topic === 'string' ? req.query.topic.trim() : '';
+  const { difficulty } = req.query;
+
+  if (!topic || !difficulty) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: 'topic and difficulty query parameters are required.',
+    });
+  }
+
+  if (!VALID_DIFFICULTIES.includes(difficulty)) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM questions
+       WHERE difficulty = $1
+         AND $2 = ANY(topics)
+       ORDER BY RANDOM()
+       LIMIT 1`,
+      [difficulty, topic]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: `No question found for topic "${topic}" with difficulty "${difficulty}".`,
+      });
+    }
+
+    const question = formatQuestion(result.rows[0]);
+    return res.status(200).json(buildQuestionResponse(question));
+  } catch (err) {
+    console.error('[getRandomQuestion]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+// ────────────────────────────────────────────────────────────
+// GET /questions/topics  (Public)
+// Returns all unique topics currently present in the DB.
+// ────────────────────────────────────────────────────────────
+const getTopics = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT topic
+         FROM (
+           SELECT unnest(topics) AS topic
+           FROM questions
+         ) AS topic_list
+        WHERE topic IS NOT NULL AND topic <> ''
+        ORDER BY topic ASC`
+    );
+
+    const topics = result.rows.map((row) => row.topic);
+
+    return res.status(200).json({
+      count: topics.length,
+      topics,
+    });
+  } catch (err) {
+    console.error('[getTopics]', err);
     return res.status(500).json({ error: 'Internal Server Error', message: err.message });
   }
 };
@@ -204,14 +324,7 @@ const getQuestionById = async (req, res) => {
 
     const question = formatQuestion(result.rows[0]);
 
-    // Notify if any image URLs are missing
-    const missingAssets = question.imageUrls.filter((url) => !url || url.trim() === '');
-    const response = { question };
-    if (missingAssets.length > 0) {
-      response.assetWarning = `${missingAssets.length} image URL(s) are empty or unavailable.`;
-    }
-
-    return res.status(200).json(response);
+    return res.status(200).json(buildQuestionResponse(question));
   } catch (err) {
     console.error('[getQuestionById]', err);
     return res.status(500).json({ error: 'Internal Server Error', message: err.message });
@@ -263,11 +376,10 @@ const updateQuestion = async (req, res) => {
 
   // Validate fields if they are provided
   if (difficulty) {
-    const validDifficulties = ['Easy', 'Medium', 'Hard'];
-    if (!validDifficulties.includes(difficulty)) {
+    if (!VALID_DIFFICULTIES.includes(difficulty)) {
       return res.status(400).json({
         error: 'Validation Error',
-        message: `difficulty must be one of: ${validDifficulties.join(', ')}`,
+        message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
       });
     }
   }
@@ -397,6 +509,8 @@ const deleteQuestion = async (req, res) => {
 export {
   createQuestion,
   getQuestions,
+  getTopics,
+  getRandomQuestion,
   getQuestionById,
   updateQuestion,
   deleteQuestion,

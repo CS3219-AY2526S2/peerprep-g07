@@ -5,7 +5,7 @@ export const LANGUAGES = ["javascript", "python", "java", "cpp", "typescript", "
 export type Topic = typeof TOPICS[number];
 export type Difficulty = typeof DIFFICULTIES[number];
 export type Language = typeof LANGUAGES[number];
-export type QueueKeyString = `${Topic}-${Difficulty}-${Language}`;
+export type QueueKeyString = `${Topic}:${Difficulty}:${Language}`;
 
 export type QueueEntry = {
     userId: string;
@@ -28,13 +28,26 @@ export type Match = {
   language: Language;
 };
 
+export type PendingMatch = {
+  pendingMatchId: string;
+  users: [string, string];
+  createdAt: number;
+  topic: Topic;
+  difficulty: Difficulty;
+  language: Language;
+};
+
 export type InboundMessage =
  | { type: "enqueue"; topic: Topic; difficulty: Difficulty; language: Language; }
- | { type: "cancel"; };
+ | { type: "cancel"; }
+ | { type: "accept_match"; pendingMatchId: string; };
 
  export type OutboundMessage =
  | { type: "queued"; queueKey: QueueKeyString }
  | { type: "matched"; match: Match }
+ | { type: "match_pending"; pendingMatch: PendingMatch }
+ | { type: "match_confirmed"; match: Match }
+ | { type: "pending_accept_timeout" }
  | { type: "timeout" }
  | { type: "cancelled" }
  | { type: "error"; message: string };

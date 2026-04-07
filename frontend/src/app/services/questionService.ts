@@ -17,6 +17,25 @@ export interface Question {
 export interface QuestionFilters {
   topics?: string[];
   difficulty?: string;
+  search?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface QuestionsResponse {
+  count: number;
+  totalCount: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  hasPreviousPage: boolean;
+  questions: Question[];
+}
+
+export interface TopicsResponse {
+  count: number;
+  topics: string[];
 }
 
 export interface CreateQuestionData {
@@ -27,16 +46,47 @@ export interface CreateQuestionData {
   leetcodeLink?: string;
   difficulty: string;
   topics: string[];
-  imageUrls?: string[];
+  imageFiles?: File[];
+  existingImageUrls?: string[];
 }
 
-export async function getQuestions(filters?: QuestionFilters): Promise<{ count: number; questions: Question[] }> {
+function buildQuestionFormData(data: Partial<CreateQuestionData>) {
+  const formData = new FormData();
+
+  if (data.title !== undefined) formData.append('title', data.title);
+  if (data.description !== undefined) formData.append('description', data.description);
+  if (data.constraints !== undefined) formData.append('constraints', data.constraints);
+  if (data.leetcodeLink !== undefined) formData.append('leetcodeLink', data.leetcodeLink);
+  if (data.difficulty !== undefined) formData.append('difficulty', data.difficulty);
+  if (data.topics !== undefined) formData.append('topics', JSON.stringify(data.topics));
+  if (data.testCases !== undefined) formData.append('testCases', JSON.stringify(data.testCases));
+  if (data.existingImageUrls !== undefined) {
+    formData.append('existingImageUrls', JSON.stringify(data.existingImageUrls));
+  }
+
+  data.imageFiles?.forEach((file) => {
+    formData.append('images', file);
+  });
+
+  return formData;
+}
+
+export async function getQuestions(filters?: QuestionFilters): Promise<QuestionsResponse> {
   const params: Record<string, string> = {};
   if (filters?.topics && filters.topics.length > 0) {
     params.topics = filters.topics.join(',');
   }
   if (filters?.difficulty) {
     params.difficulty = filters.difficulty;
+  }
+  if (filters?.search) {
+    params.search = filters.search;
+  }
+  if (filters?.page) {
+    params.page = String(filters.page);
+  }
+  if (filters?.pageSize) {
+    params.pageSize = String(filters.pageSize);
   }
   const response = await apiClient.get('/questions', { params });
   return response.data;
@@ -47,13 +97,18 @@ export async function getQuestionById(id: number): Promise<{ question: Question 
   return response.data;
 }
 
+export async function getTopics(): Promise<TopicsResponse> {
+  const response = await apiClient.get('/questions/topics');
+  return response.data;
+}
+
 export async function createQuestion(data: CreateQuestionData) {
-  const response = await apiClient.post('/questions', data);
+  const response = await apiClient.post('/questions', buildQuestionFormData(data));
   return response.data;
 }
 
 export async function updateQuestion(id: number, data: Partial<CreateQuestionData>) {
-  const response = await apiClient.put(`/questions/${id}`, data);
+  const response = await apiClient.put(`/questions/${id}`, buildQuestionFormData(data));
   return response.data;
 }
 
