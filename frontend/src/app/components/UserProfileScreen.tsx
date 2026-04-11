@@ -2,22 +2,13 @@ import { Button } from "@/app/components/ui/button";
 import { Input } from "@/app/components/ui/input";
 import { Label } from "@/app/components/ui/label";
 import { Badge } from "@/app/components/ui/badge";
-import {
-  User,
-  Mail,
-  Award,
-  Code,
-  Save,
-  Shield,
-  Lock,
-  Crown,
-  Trash2,
-  AlertTriangle,
-} from "lucide-react";
+import { User, Mail, Lock, Save, Shield, Crown, Trash2, AlertTriangle } from "lucide-react";
 import { useMemo, useState, useEffect } from "react";
 import { getProfile, updateProfile, changePassword, deleteAccount } from "@/app/services/authService";
 import { getMyAttemptHistory, type AttemptHistoryEntry } from "@/app/services/attemptHistoryService";
 import { AttemptHistoryPanel } from "@/app/components/AttemptHistoryPanel";
+import { extractApiErrorMessage } from "../utils/apiError";
+import { toast } from "sonner";
 
 const formatTimestamp = (timestamp: string) => {
   try {
@@ -38,13 +29,11 @@ export function UserProfileScreen() {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmNewPassword, setConfirmNewPassword] = useState("");
-  const [passwordMessage, setPasswordMessage] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [attemptsLoading, setAttemptsLoading] = useState(true);
   const [attempts, setAttempts] = useState<AttemptHistoryEntry[]>([]);
   const [error, setError] = useState("");
-  const [saveMessage, setSaveMessage] = useState("");
 
   useEffect(() => {
     const fetchProfileAndHistory = async () => {
@@ -58,8 +47,8 @@ export function UserProfileScreen() {
         setRole(profile.access_role || "user");
         setAttempts(attemptHistory.attempts);
         setProfileImageUrl(profile.profile_image_url || "");
-      } catch (err: any) {
-        setError("Failed to load profile");
+      } catch (err: unknown) {
+        setError(extractApiErrorMessage(err, "Failed to load profile"));
       } finally {
         setIsLoading(false);
         setAttemptsLoading(false);
@@ -71,12 +60,11 @@ export function UserProfileScreen() {
 
   const handleSave = async () => {
     setIsSaving(true);
-    setSaveMessage("");
     try {
       await updateProfile({ username, profile_image: selectedImage || undefined });
-      setSaveMessage("Profile updated successfully!");
-    } catch (err: any) {
-      setSaveMessage(err.response?.data?.error || "Failed to update profile");
+      toast.success("Profile updated successfully!");
+    } catch (err: unknown) {
+      toast.error(extractApiErrorMessage(err, "Failed to update profile"));
     } finally {
       setIsSaving(false);
     }
@@ -92,26 +80,25 @@ export function UserProfileScreen() {
 
   const handleChangePassword = async () => {
     setIsSaving(true);
-    setPasswordMessage("");
     if (!currentPassword || !newPassword || !confirmNewPassword) {
-      setPasswordMessage("Please fill in all password fields");
+      toast.error("Please fill in all password fields");
       setIsSaving(false);
       return;
     }
     if (newPassword !== confirmNewPassword) {
-      setPasswordMessage("New passwords do not match");
+      toast.error("New passwords do not match");
       setIsSaving(false);
       return;
     }
     try {
       await changePassword(currentPassword, newPassword);
-      setPasswordMessage("Password changed successfully!");
+      toast.success("Password changed successfully!");
       setIsChangingPassword(false);
       setCurrentPassword("");
       setNewPassword("");
       setConfirmNewPassword("");
-    } catch (err: any) {
-      setPasswordMessage(err.response?.data?.error || "Failed to change password");
+    } catch (err: unknown) {
+      toast.error(extractApiErrorMessage(err, "Failed to change password"));
     } finally {
       setIsSaving(false);
     }
@@ -128,9 +115,9 @@ export function UserProfileScreen() {
         setSelectedImage(null);
       };
       fetchProfile();
-      setSaveMessage("Changes reverted successfully!");
-    } catch (err: any) {
-      setSaveMessage("Failed to revert changes");
+      toast.success("Changes reverted successfully!");
+    } catch (err: unknown) {
+      toast.error(extractApiErrorMessage(err, "Failed to revert changes"));
     }
   };
 
@@ -144,6 +131,10 @@ export function UserProfileScreen() {
 
   if (isLoading) {
     return <div className="text-center py-12 text-gray-500">Loading profile...</div>;
+  }
+
+  if (error) {
+    return <div className="text-center py-12 text-red-500">{error}</div>;
   }
 
   return (
@@ -317,39 +308,9 @@ export function UserProfileScreen() {
                 />
               </div>
             </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="language" className="text-gray-700">Preferred Language</Label>
-              <select
-                id="language"
-                defaultValue="JavaScript"
-                className="w-full h-10 px-3 border-2 border-gray-300 rounded-md bg-white"
-              >
-                <option>JavaScript</option>
-                <option>Python</option>
-                <option>Java</option>
-                <option>C++</option>
-              </select>
-            </div>
           </div>
 
           <div className="space-y-2">
-            <Label className="text-gray-700 flex items-center gap-2">
-              <Code className="h-4 w-4" />
-              Topics of Interest
-            </Label>
-            <div className="border-2 border-gray-300 rounded-lg p-4 min-h-[100px]">
-              <div className="flex flex-wrap gap-2">
-                <Badge variant="secondary" className="border border-gray-300">Algorithms</Badge>
-                <Badge variant="secondary" className="border border-gray-300">Data Structures</Badge>
-                <Badge variant="secondary" className="border border-gray-300">Dynamic Programming</Badge>
-                <Badge variant="secondary" className="border border-gray-300">System Design</Badge>
-                <Button variant="outline" size="sm" className="border-2 border-dashed border-gray-400">
-                  + Add Topic
-                </Button>
-              </div>
-          </div>
-
           {/* Change Password Section */}
           <div className="pt-4 border-t-2 border-gray-200">
             <div className="flex items-center justify-between">
@@ -369,8 +330,8 @@ export function UserProfileScreen() {
                   <Label htmlFor="current-password" className="text-gray-700">Current Password</Label>
                   <div className="relative">
                     <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
-                    <Input 
-                      id="current-password" 
+                    <Input
+                      id="current-password"
                       type="password"
                       value={currentPassword}
                       onChange={(e) => setCurrentPassword(e.target.value)}
@@ -383,8 +344,8 @@ export function UserProfileScreen() {
                   <Label htmlFor="new-password" className="text-gray-700">New Password</Label>
                   <div className="relative">
                     <Shield className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
-                    <Input 
-                      id="new-password" 
+                    <Input
+                      id="new-password"
                       type="password"
                       value={newPassword}
                       onChange={(e) => setNewPassword(e.target.value)}
@@ -397,8 +358,8 @@ export function UserProfileScreen() {
                   <Label htmlFor="confirm-new-password" className="text-gray-700">Confirm New Password</Label>
                   <div className="relative">
                     <Shield className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
-                    <Input 
-                      id="confirm-new-password" 
+                    <Input
+                      id="confirm-new-password"
                       type="password"
                       value={confirmNewPassword}
                       onChange={(e) => setConfirmNewPassword(e.target.value)}
@@ -416,11 +377,6 @@ export function UserProfileScreen() {
                   {isSaving ? 'Saving...' : 'Save New Password'}
                 </Button>
 
-                {passwordMessage && (
-                  <p className={`text-sm ${passwordMessage.includes('success') ? 'text-green-600' : 'text-red-600'}`}>
-                    {passwordMessage}
-                  </p>
-                )}
               </div>
             )}
           </div>
@@ -453,14 +409,8 @@ export function UserProfileScreen() {
             </div>
           </div>
 
-          {saveMessage && (
-            <p className={`text-sm ${saveMessage.includes("success") ? "text-green-600" : "text-red-600"}`}>
-              {saveMessage}
-            </p>
-          )}
-
           <div className="flex justify-end gap-2 pt-4">
-            <Button variant="outline" className="border-2 border-gray-300" onClick={handleCancel} disabled={isSaving}> 
+            <Button variant="outline" className="border-2 border-gray-300" onClick={handleCancel} disabled={isSaving}>
               Cancel
             </Button>
             <Button className="bg-blue-600 hover:bg-blue-700 text-white" onClick={handleSave} disabled={isSaving}>

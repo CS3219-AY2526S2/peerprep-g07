@@ -20,6 +20,12 @@ export interface UserProfile {
   profile_image_url: string;
 }
 
+export interface UserProfileResponse {
+  users: UserProfile[];
+  totalPages: number;
+  currentPage: number;
+}
+
 export interface UserProfileUpdateData {
   username?: string;
   profile_image?: File;
@@ -71,6 +77,11 @@ export async function getProfile(): Promise<UserProfile> {
   return response.data;
 }
 
+export async function getProfileByUsername(username: string): Promise<UserProfile> {
+  const response = await apiClient.get(`/users/by-username/${encodeURIComponent(username)}`);
+  return response.data;
+}
+
 export async function updateProfile(userData: Partial<UserProfileUpdateData>) {
   const formData = new FormData();
   if (userData.username !== undefined) formData.append('username', userData.username);
@@ -92,8 +103,10 @@ export async function deleteAccount() {
   return response.data;
 }
 
-export async function getAllUsers(): Promise<UserProfile[]> {
-  const response = await apiClient.get('/users/all');
+export async function getAllUsers(query: string, page: number, limit: number): Promise<UserProfileResponse> {
+  const response = await apiClient.get('/users/all', {
+    params: { query, page, limit }
+  });
   return response.data;
 }
 

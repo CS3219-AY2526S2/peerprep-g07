@@ -2,11 +2,13 @@ import {
   createUser as _createUser,
   getUserByEmail as _getUserByEmail,
   getUserById as _getUserById,
+  getUserByUsername as _getUserByUsername,
   updateUser as _updateUser,
   updateUserPassword as _updateUserPassword,
   deleteUserByEmail as _deleteUserByEmail,
   updateUserRoleByEmail as _updateUserRoleByEmail,
   getAllUsers as _getAllUsers,
+  getTotalUsersCount as _getTotalUsersCount,
 } from "../database/query.js";
 import bcrypt from 'bcrypt';
 import jwt from "jsonwebtoken";
@@ -21,13 +23,19 @@ export async function createUser(req, res) {
     if (!email || !username || !password) {
       return res
         .status(400)
-        .json({ error: 'Email, username, and password are required' });
+        .json({ error: "Email, username, and password are required" });
     }
 
     // Check if email already exists
     const existingUser = await _getUserByEmail(email);
     if (existingUser) {
-      return res.status(409).json({ error: 'Email already exists' });
+      return res.status(409).json({ error: "Email already exists" });
+    }
+
+    // Check if username already exists
+    const existingUsername = await _getUserByUsername(username);
+    if (existingUsername) {
+      return res.status(409).json({ error: "Username already exists" });
     }
 
     // check if password is valid
@@ -39,7 +47,7 @@ export async function createUser(req, res) {
     if (!isMinLength || !hasUpperCase || !hasLowerCase || !hasDigit) {
       return res.status(400).json({
         error:
-          'Password must be at least 8 characters long and include uppercase letters, lowercase letters, and digits',
+          "Password must be at least 8 characters long and include uppercase letters, lowercase letters, and digits",
       });
     }
 
@@ -100,6 +108,20 @@ export async function getUserById(req, res) {
   }
 }
 
+export async function getUserByUsername(req, res) {
+  try {
+    const { username } = req.params;
+    const user = await _getUserByUsername(username);
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    return res.status(200).json(mapUserToView(user));
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to retrieve user" });
+  }
+}
+
 export async function updateUser(req, res) {
   try {
     const { email } = req.user;
@@ -112,6 +134,11 @@ export async function updateUser(req, res) {
     const user = await _getUserByEmail(email);
     if (!user) {
       return res.status(404).json({ error: "User not found" });
+    }
+
+    const existingUsername = await _getUserByUsername(username);
+    if (existingUsername && existingUsername.email !== email) {
+      return res.status(409).json({ error: "Username already exists" });
     }
 
     let imageUrl;
@@ -153,16 +180,12 @@ export async function updateUser(req, res) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const updatedUser = mapUserToView(result);
     const token = jwt.sign(
-      {
-        id: updatedUser.id,
-        email: updatedUser.email,
-        username: updatedUser.username,
-      },
+      { id: result.id, email: result.email, username: result.username },
       process.env.JWT_SECRET,
       { expiresIn: "3d" },
     );
+    const updatedUser = mapUserToView(result);
 
     return res.status(200).json({ ...updatedUser, token });
   } catch (error) {
@@ -273,8 +296,26 @@ export async function updateUserRoleByEmail(req, res) {
 
 export async function getAllUsers(req, res) {
   try {
-    const users = await _getAllUsers();
-    return res.status(200).json(users.map(mapUserToView));
+    const { query = "", page = "1", limit = "10" } = req.query;
+
+    const parsedPage = parseInt(page);
+    const parsedLimit = parseInt(limit);
+
+    if (isNaN(parsedPage) || parsedPage < 1) {
+      return res.status(400).json({ error: "Invalid page number" });
+    }
+    if (isNaN(parsedLimit) || parsedLimit < 1) {
+      return res.status(400).json({ error: "Invalid limit value" });
+    }
+
+    const users = await _getAllUsers(query, parsedPage, parsedLimit);
+    const totalUsers = await _getTotalUsersCount(query);
+    const totalPages = Math.ceil(totalUsers / parsedLimit);
+    return res.status(200).json({
+      users: users.map(mapUserToView),
+      totalPages,
+      currentPage: page,
+    });
   } catch (error) {
     console.error('Error retrieving users:', error);
     return res.status(500).json({ error: 'Failed to retrieve users' });

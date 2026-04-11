@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -24,7 +25,9 @@ import {
 import { Badge } from "../../app/components/ui/badge";
 import { Button } from "../../app/components/ui/button";
 import { Label } from "../../app/components/ui/label";
+import { getProfileByUsername, UserProfile } from "../services/authService";
 import { getTopics } from "../services/questionService";
+import { extractApiErrorMessage } from "../utils/apiError";
 
 type MatchingState =
   | "idle"
@@ -55,8 +58,7 @@ interface PendingMatchInfo {
 interface MatchingDashboardProps {
   onMatchingStateChange?: (isSearching: boolean) => void;
 }
-
-const MATCH_ACCEPT_TIMEOUT_SECONDS = 15;
+  const MATCH_ACCEPT_TIMEOUT_SECONDS = 20;
 const TOPIC_MAP: Record<string, string> = {
   "Algorithms": "algorithms",
   "Data Structures": "data-structures",
@@ -89,7 +91,8 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
   const [showWarning, setShowWarning] = useState(false);
   const [matchData, setMatchData] = useState<MatchInfo | null>(null);
   const [pendingMatchData, setPendingMatchData] = useState<PendingMatchInfo | null>(null);
-  const [currentUserId, setCurrentUserId] = useState<string>("");
+  const [currentUsername, setCurrentUsername] = useState<string>("");
+  const [peerUserProfile, setPeerUserProfile] = useState<UserProfile | null>(null);
   const [hasAcceptedMatch, setHasAcceptedMatch] = useState(false);
   const [matchAcceptTimeRemaining, setMatchAcceptTimeRemaining] = useState(MATCH_ACCEPT_TIMEOUT_SECONDS);
   const [pendingAcceptTimeoutSeconds, setPendingAcceptTimeoutSeconds] = useState(5);
@@ -146,40 +149,29 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
       wsRef.current = null;
     }
 
-    setMatchingState("searching");
-    setTimeRemaining(30);
-    setShowWarning(false);
-    setMatchData(null);
-    setPendingMatchData(null);
-    setHasAcceptedMatch(false);
-    setErrorMessage("");
-    setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
-    setPendingAcceptTimeoutSeconds(5);
-    setPendingAcceptTimeoutReason("");
-
     const token = localStorage.getItem("token");
-    let userId = "";
+    let username = "";
     if (token) {
       try {
         const payload = JSON.parse(atob(token.split(".")[1]));
-        userId = payload.username || payload.id || payload.sub || payload.email || "";
+        username = payload.username || payload.id || payload.sub || payload.email || "";
       } catch {
         // ignore malformed token
       }
     }
 
-    if (!userId) {
+    if (!username) {
       setMatchingState("idle");
       setErrorMessage("You must be logged in to match.");
       return;
     }
 
-    setCurrentUserId(userId);
+    setCurrentUsername(username);
 
     const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:3004/api";
     // Derive WS URL from the API URL: http(s)://host:port/api -> ws(s)://host:port/ws/match
     const baseUrl = apiUrl.replace(/\/api\/?$/, "");
-    const wsUrl = baseUrl.replace(/^http/, "ws") + `/ws/match?userId=${encodeURIComponent(userId)}`;
+    const wsUrl = baseUrl.replace(/^http/, "ws") + `/ws/match?userId=${encodeURIComponent(username)}`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -202,7 +194,16 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
       }
 
       if (msg.type === "queued") {
-        // Already showing "searching" state
+        setMatchingState("searching");
+        setTimeRemaining(30);
+        setShowWarning(false);
+        setMatchData(null);
+        setPendingMatchData(null);
+        setHasAcceptedMatch(false);
+        setErrorMessage("");
+        setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
+        setPendingAcceptTimeoutSeconds(5);
+        setPendingAcceptTimeoutReason("");
       } else if (msg.type === "match_pending") {
         const pendingMatch = msg.pendingMatch as PendingMatchInfo;
         const remainingTime = Math.max(
@@ -219,7 +220,6 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
         setPendingMatchData(null);
         setHasAcceptedMatch(false);
         setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
-        localStorage.setItem("roomId", confirmedMatch.roomId);
         navigate(`/collaboration?roomId=${encodeURIComponent(confirmedMatch.roomId)}`);
       } else if (msg.type === "matched") {
         setMatchingState("matched");
@@ -227,7 +227,6 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
         const confirmedMatch = msg.match as MatchInfo;
         setMatchData(confirmedMatch);
         setMatchAcceptTimeRemaining(MATCH_ACCEPT_TIMEOUT_SECONDS);
-        localStorage.setItem("roomId", confirmedMatch.roomId);
         navigate(`/collaboration?roomId=${encodeURIComponent(confirmedMatch.roomId)}`);
       } else if (msg.type === "timeout") {
         setMatchingState("timeout");
@@ -242,7 +241,9 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
       } else if (msg.type === "match_abandoned") {
         setMatchingState("abandoned");
       } else if (msg.type === "error") {
-        setErrorMessage(msg.message as string);
+        const wsErrorMessage = msg.message as string;
+        toast.error(wsErrorMessage);
+        setErrorMessage(wsErrorMessage);
         setMatchingState("idle");
       }
     };
@@ -304,11 +305,33 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
 
   const navigate = useNavigate();
 
-  useEffect(() => {
-    const storedRoomId = localStorage.getItem("roomId");
-    if (!storedRoomId) return;
 
-    navigate(`/collaboration?roomId=${encodeURIComponent(storedRoomId)}`);
+  // This is to check if users are in an exisiting room and they have close the tab,
+  // if yes then navigate to the collaboration page
+  useEffect(() => {
+    const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:3004/api";
+
+    const resolveExistingRoom = async () => {
+      try {
+        const token = localStorage.getItem("token");
+        const response = await fetch(`${apiUrl.replace(/\/$/, "")}/collab/my-room`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+
+        if (!response.ok) {
+          return;
+        }
+
+        const data = (await response.json()) as { roomId?: string };
+        if (data.roomId) {
+          navigate(`/collaboration?roomId=${encodeURIComponent(data.roomId)}`);
+        }
+      } catch {
+        // Ignore lookup failures and stay on the matching page.
+      }
+    };
+
+    void resolveExistingRoom();
   }, [navigate]);
 
   useEffect(() => {
@@ -336,14 +359,14 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
         if (data.topics.length === 0) {
           setTopicsError("No topics are currently available.");
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (isCancelled) {
           return;
         }
 
         setAvailableTopics([]);
         setSelectedTopic("");
-        setTopicsError(err.response?.data?.error || "Failed to load topics");
+        setTopicsError(extractApiErrorMessage(err, "Failed to load topics"));
       } finally {
         if (!isCancelled) {
           setIsLoadingTopics(false);
@@ -358,6 +381,7 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     };
   }, []);
 
+  // This is to navigate to collaboration page after matching
   const navigateToCollaboration = () => {
     if (pendingMatchData) {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
@@ -385,16 +409,15 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
     const targetRoomId = matchData?.roomId;
     if (!targetRoomId) return;
 
-    localStorage.setItem("roomId", targetRoomId);
     navigate(`/collaboration?roomId=${encodeURIComponent(targetRoomId)}`);
   }
 
   const matchedUsers = pendingMatchData?.users ?? matchData?.users ?? null;
   const matchedPeerId = matchedUsers
-    ? matchedUsers.find((userId) => userId !== currentUserId) ?? matchedUsers[0]
+    ? matchedUsers.find((username) => username !== currentUsername) ?? matchedUsers[0]
     : "";
   const matchedDifficulty = pendingMatchData?.difficulty;
-  const matchedTopic = pendingMatchData?.topic;
+  const matchedTopic = pendingMatchData?.topic.replace(/-/g, " ");
   const matchedLanguage = pendingMatchData?.language;
 
   // Cleanup WebSocket on unmount
@@ -465,6 +488,14 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
   useEffect(() => {
     onMatchingStateChange?.(matchingState === "searching");
   }, [matchingState, onMatchingStateChange]);
+
+  useEffect(() => {
+    if (matchedPeerId) {
+      getProfileByUsername(matchedPeerId).then(setPeerUserProfile);
+    } else {
+      setPeerUserProfile(null);
+    }
+  }, [matchedPeerId]);
 
   useEffect(() => {
     if (matchingState === "idle") {
@@ -754,11 +785,19 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
               <div className="p-6 bg-green-50 border-2 border-green-200 rounded-lg">
                 <div className="flex items-center justify-center gap-4 mb-4">
                   <div className="w-16 h-16 border-3 border-gray-400 rounded-full flex items-center justify-center bg-gray-100">
-                    <Users className="w-8 h-8 text-gray-400" />
+                    {peerUserProfile?.profile_image_url ? (
+                      <img
+                        src={peerUserProfile.profile_image_url}
+                        alt="Profile"
+                        className="w-full h-full object-cover rounded-full"
+                      />
+                    ) : (
+                      <Users className="w-8 h-8 text-gray-400" />
+                    )}
                   </div>
                   <div className="text-left">
                     <div className="font-semibold text-gray-900 text-lg">
-                      {matchedPeerId || "Matched User"}
+                      {peerUserProfile?.username || matchedPeerId || "Matched User"}
                     </div>
                     <div className="text-sm text-gray-600">Online now</div>
                   </div>
