@@ -1,3 +1,8 @@
+// AI Assistance Disclosure:
+// Tool: GitHub Copilot (model: Claude Opus 4.6), date: 2026-04-12
+// Scope: Changed navigation label from "Match Dashboard" to "Matching Dashboard".
+// Author review: Verified the label change renders correctly in the navigation bar.
+
 import { useState, useEffect, useRef } from "react";
 import { Route, Routes } from "react-router-dom";
 import { Button } from "@/app/components/ui/button";
@@ -11,7 +16,7 @@ import {
 } from "lucide-react";
 import { LoginScreen } from "@/app/components/LoginScreen";
 import { SignupScreen } from "@/app/components/SignupScreen";
-import { ForgotPasswordScreen } from "@/app/components/ForgotPasswordScreen";
+
 import { UserProfileScreen } from "@/app/components/UserProfileScreen";
 import { MatchingDashboard } from "@/app/components/MatchingDashboard";
 import { QuestionLibrary } from "@/app/components/QuestionLibrary";
@@ -34,7 +39,7 @@ import {
 import { isAuthenticated, logout, getProfile } from "@/app/services/authService";
 import { Question } from "./services/questionService";
 
-type Screen = "login" | "signup" | "forgotPassword" | "profile" | "matching" | "questions" | "addQuestion" | "editQuestion" | "solo" | "admin";
+type Screen = "login" | "signup" | "profile" | "matching" | "questions" | "addQuestion" | "editQuestion" | "solo" | "admin";
 
 function MainAppPage() {
   const [currentScreen, setCurrentScreen] = useState<Screen>("login");
@@ -104,14 +109,11 @@ function MainAppPage() {
     if (currentScreen === "signup") {
       return <SignupScreen onNavigateToLogin={() => setCurrentScreen("login")} />;
     }
-    if (currentScreen === "forgotPassword") {
-      return <ForgotPasswordScreen onNavigateToLogin={() => setCurrentScreen("login")} />;
-    }
-    return <LoginScreen onNavigateToSignup={() => setCurrentScreen("signup")} onNavigateToForgotPassword={() => setCurrentScreen("forgotPassword")} onNavigateToDashboard={handleLogin} />;
+    return <LoginScreen onNavigateToSignup={() => setCurrentScreen("signup")} onNavigateToDashboard={handleLogin} />;
   }
 
   const navigationItems = [
-    { id: "matching" as Screen, label: "Match Dashboard", icon: Users },
+    { id: "matching" as Screen, label: "Matching Dashboard", icon: Users },
     ...(userRole === "admin" || userRole === "root-admin" ? [{ id: "questions" as Screen, label: "Question Library", icon: BookOpen }] : []),
     { id: "profile" as Screen, label: "Profile", icon: User },
     ...(userRole === "root-admin" ? [{ id: "admin" as Screen, label: "User Management", icon: Shield }] : []),

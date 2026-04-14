@@ -56,7 +56,7 @@ interface PendingMatchInfo {
 }
 
 interface MatchingDashboardProps {
-  onMatchingStateChange?: (isSearching: boolean) => void;
+  onMatchingStateChange?: (isMatchingActive: boolean) => void;
 }
   const MATCH_ACCEPT_TIMEOUT_SECONDS = 20;
 const TOPIC_MAP: Record<string, string> = {
@@ -486,10 +486,13 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
 
   // Notify parent when matching state changes
   useEffect(() => {
-    onMatchingStateChange?.(matchingState === "searching");
+    onMatchingStateChange?.(
+      matchingState === "searching" || matchingState === "matched",
+    );
   }, [matchingState, onMatchingStateChange]);
 
   useEffect(() => {
+    // AI generated (Edited by Xiang Yu)
     if (matchedPeerId) {
       getProfileByUsername(matchedPeerId).then(setPeerUserProfile);
     } else {
@@ -513,7 +516,7 @@ export function MatchingDashboard({ onMatchingStateChange }: MatchingDashboardPr
             <Target className="w-5 h-5" />
           </div>
           <div>
-            <h1 className="text-2xl font-bold">Find a Match</h1>
+            <h1 className="text-2xl font-bold">Matching Dashboard</h1>
             <p className="text-purple-100 text-sm">Get paired with a peer to practice coding together</p>
           </div>
         </div>
