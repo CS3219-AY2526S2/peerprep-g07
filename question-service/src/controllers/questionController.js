@@ -1,0 +1,681 @@
+import pool from '../db/index.js';
+import { uploadImage, deleteImages } from '../services/s3Service.js';
+import {
+  buildDuplicateResponse,
+  buildUniqueViolationResponse,
+  findDuplicateQuestion,
+  isQuestionUniqueViolation,
+} from '../services/questionIdentityService.js';
+import {
+  buildQuestionVersionMatchExpression,
+  getExpectedQuestionVersion,
+  matchesQuestionVersion,
+  sendMissingQuestionVersionResponse,
+  sendQuestionVersionConflictResponse,
+} from '../services/questionVersionService.js';
+
+const VALID_DIFFICULTIES = ['Easy', 'Medium', 'Hard'];
+const DEFAULT_QUESTION_PAGE_SIZE = 12;
+const MAX_QUESTION_PAGE_SIZE = 100;
+
+// ────────────────────────────────────────────────────────────
+// Helper: map DB row → clean API response object
+// ────────────────────────────────────────────────────────────
+const formatQuestion = (row) => ({
+  questionId: row.question_id,
+  title: row.title,
+  description: row.description,
+  constraints: row.constraints,
+  testCases: row.test_cases,
+  leetcodeLink: row.leetcode_link,
+  difficulty: row.difficulty,
+  topics: row.topics,
+  imageUrls: row.image_urls,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+
+const buildQuestionResponse = (question) => {
+  const missingAssets = question.imageUrls.filter((url) => !url || url.trim() === '');
+  const response = { question };
+
+  if (missingAssets.length > 0) {
+    response.assetWarning = `${missingAssets.length} image URL(s) are empty or unavailable.`;
+  }
+
+  return response;
+};
+
+const parsePositiveInteger = (value, fallback) => {
+  const parsed = parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const isBlank = (value) => value === undefined || value === null || String(value).trim() === '';
+
+const sendDuplicateResponse = (res, duplicate) =>
+  res.status(409).json(buildDuplicateResponse(duplicate));
+
+const loadQuestionById = async (questionId) => {
+  const result = await pool.query('SELECT * FROM questions WHERE question_id = $1', [questionId]);
+  return result.rows[0] || null;
+};
+
+const resolveQuestionWriteConflict = async (questionId, res) => {
+  const currentQuestionRow = await loadQuestionById(questionId);
+
+  if (!currentQuestionRow) {
+    return res.status(404).json({ error: 'Not Found', message: `Question with ID ${questionId} not found.` });
+  }
+
+  return sendQuestionVersionConflictResponse(res, currentQuestionRow, formatQuestion);
+};
+
+// ────────────────────────────────────────────────────────────
+// Helper: validate and upload image files to S3
+// Returns array of S3 URLs
+// ────────────────────────────────────────────────────────────
+// AI-generated (edited by Jasmine)
+const handleImageUploads = async (files) => {
+  if (!files || files.length === 0) return [];
+ 
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+  const invalidFiles = files.filter(f => !allowedTypes.includes(f.mimetype));
+  if (invalidFiles.length > 0) {
+    throw new Error(`Invalid file type(s): ${invalidFiles.map(f => f.originalname).join(', ')}. Allowed: jpeg, png, gif, webp.`);
+  }
+ 
+  const maxSize = 5 * 1024 * 1024; // 5MB
+  const oversizedFiles = files.filter(f => f.size > maxSize);
+  if (oversizedFiles.length > 0) {
+    throw new Error(`File(s) too large: ${oversizedFiles.map(f => f.originalname).join(', ')}. Max size is 5MB.`);
+  }
+ 
+  const uploadPromises = files.map(f => uploadImage(f.buffer, f.originalname, f.mimetype));
+  return Promise.all(uploadPromises);
+};
+
+// ────────────────────────────────────────────────────────────
+// POST /questions  (Admin only)
+// ────────────────────────────────────────────────────────────
+const createQuestion = async (req, res) => {
+  const {
+    title,
+    description,
+    constraints,
+    leetcodeLink,
+    difficulty,
+  } = req.body;
+
+  let topics, testCases;
+  try {
+    topics = typeof req.body.topics === 'string' ? JSON.parse(req.body.topics) : req.body.topics;
+    testCases = typeof req.body.testCases === 'string' ? JSON.parse(req.body.testCases) : req.body.testCases;
+  } catch {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: 'topics and testCases must be valid JSON arrays.',
+    });
+  }
+
+  // Validate required fields
+  const missing = [];
+  if (isBlank(title)) missing.push('title');
+  if (isBlank(description)) missing.push('description');
+  if (isBlank(difficulty)) missing.push('difficulty');
+  if (isBlank(leetcodeLink)) missing.push('leetcodeLink');
+  if (!topics || !Array.isArray(topics) || topics.length === 0) missing.push('topics');
+  if (!testCases || !Array.isArray(testCases) || testCases.length === 0) missing.push('testCases');
+
+  if (missing.length > 0) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: 'The following required fields are missing or invalid.',
+      missingFields: missing,
+    });
+  }
+
+  // Validate difficulty enum
+  if (!VALID_DIFFICULTIES.includes(difficulty)) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
+    });
+  }
+
+  try {
+    const duplicateQuestion = await findDuplicateQuestion({ title, leetcodeLink });
+    if (duplicateQuestion) {
+      return sendDuplicateResponse(res, duplicateQuestion);
+    }
+  } catch (err) {
+    console.error('[createQuestion] duplicate check failed:', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+
+  // Upload images to S3 if any were attached
+  let imageUrls = [];
+  try {
+    imageUrls = await handleImageUploads(req.files);
+  } catch (err) {
+    return res.status(400).json({ error: 'Validation Error', message: err.message });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO questions
+         (title, description, constraints, test_cases, leetcode_link, difficulty, topics, image_urls)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        title,
+        description,
+        constraints || null,
+        JSON.stringify(testCases),
+        leetcodeLink,
+        difficulty,
+        topics,
+        imageUrls || [],
+      ]
+    );
+
+    return res.status(201).json({
+      message: 'Question created successfully.',
+      question: formatQuestion(result.rows[0]),
+    });
+  } catch (err) {
+    if (imageUrls.length > 0) {
+      await deleteImages(imageUrls).catch(e => console.error('[createQuestion] S3 cleanup failed:', e));
+    }
+    if (isQuestionUniqueViolation(err)) {
+      const duplicateQuestion = await findDuplicateQuestion({ title, leetcodeLink }).catch(e => {
+        console.error('[createQuestion] duplicate lookup after unique violation failed:', e);
+        return null;
+      });
+      if (duplicateQuestion) {
+        return sendDuplicateResponse(res, duplicateQuestion);
+      }
+      return res.status(409).json(buildUniqueViolationResponse(err));
+    }
+    console.error('[createQuestion]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+// ────────────────────────────────────────────────────────────
+// GET /questions  (Public)
+// Retrieve by topics + difficulty
+// Both filters are optional; if neither is provided all questions are returned.
+// ────────────────────────────────────────────────────────────
+// AI-generated (edited by Jasmine)
+const getQuestions = async (req, res) => {
+  const { topics, difficulty } = req.query;
+  const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+  const requestedPage = parsePositiveInteger(req.query.page, 1);
+  const requestedPageSize = parsePositiveInteger(req.query.pageSize, DEFAULT_QUESTION_PAGE_SIZE);
+  const pageSize = Math.min(requestedPageSize, MAX_QUESTION_PAGE_SIZE);
+
+  const conditions = [];
+  const params = [];
+
+  if (difficulty) {
+    if (!VALID_DIFFICULTIES.includes(difficulty)) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
+      });
+    }
+    params.push(difficulty);
+    conditions.push(`difficulty = $${params.length}`);
+  }
+
+  if (topics) {
+    const topicList = req.query.topics.split(',').map(t => t.trim());
+    params.push(topicList);
+    conditions.push(`topics && $${params.length}::text[]`);
+  }
+
+  if (search) {
+    params.push(`%${search}%`);
+    conditions.push(
+      `(title ILIKE $${params.length} OR description ILIKE $${params.length} OR array_to_string(topics, ' ') ILIKE $${params.length})`
+    );
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  try {
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM questions ${whereClause}`,
+      params
+    );
+    const totalCount = countResult.rows[0]?.total || 0;
+    const totalPages = totalCount > 0 ? Math.ceil(totalCount / pageSize) : 0;
+    const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
+    const offset = (page - 1) * pageSize;
+
+    const queryParams = [...params, pageSize, offset];
+    const result = await pool.query(
+      `SELECT * FROM questions
+       ${whereClause}
+       ORDER BY question_id ASC
+       LIMIT $${queryParams.length - 1}
+       OFFSET $${queryParams.length}`,
+      queryParams
+    );
+
+    // Return all assets; note missing image URLs in response
+    const questions = result.rows.map(formatQuestion);
+    const questionsWithAssetStatus = questions.map((q) => {
+      const missingAssets = q.imageUrls.filter((url) => !url || url.trim() === '');
+      if (missingAssets.length > 0) {
+        return {
+          ...q,
+          assetWarning: `${missingAssets.length} image URL(s) are empty or unavailable.`,
+        };
+      }
+      return q;
+    });
+
+    return res.status(200).json({
+      count: questionsWithAssetStatus.length,
+      totalCount,
+      page,
+      pageSize,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPreviousPage: page > 1,
+      questions: questionsWithAssetStatus,
+    });
+  } catch (err) {
+    console.error('[getQuestions]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+// AI-generated (edited by Jasmine)
+const getRandomQuestion = async (req, res) => {
+  const topic = typeof req.query.topic === 'string' ? req.query.topic.trim() : '';
+  const { difficulty } = req.query;
+
+  if (!topic || !difficulty) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: 'topic and difficulty query parameters are required.',
+    });
+  }
+
+  if (!VALID_DIFFICULTIES.includes(difficulty)) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM questions
+       WHERE difficulty = $1
+         AND $2 = ANY(topics)
+       ORDER BY RANDOM()
+       LIMIT 1`,
+      [difficulty, topic]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: `No question found for topic "${topic}" with difficulty "${difficulty}".`,
+      });
+    }
+
+    const question = formatQuestion(result.rows[0]);
+    return res.status(200).json(buildQuestionResponse(question));
+  } catch (err) {
+    console.error('[getRandomQuestion]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+// ────────────────────────────────────────────────────────────
+// GET /questions/topics  (Public)
+// Returns all unique topics currently present in the DB.
+// ────────────────────────────────────────────────────────────
+const getTopics = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT topic
+         FROM (
+           SELECT unnest(topics) AS topic
+           FROM questions
+         ) AS topic_list
+        WHERE topic IS NOT NULL AND topic <> ''
+        ORDER BY topic ASC`
+    );
+
+    const topics = result.rows.map((row) => row.topic);
+
+    return res.status(200).json({
+      count: topics.length,
+      topics,
+    });
+  } catch (err) {
+    console.error('[getTopics]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+// ────────────────────────────────────────────────────────────
+// GET /questions/:id  (Public)
+// ────────────────────────────────────────────────────────────
+const getQuestionById = async (req, res) => {
+  const { id } = req.params;
+
+  if (isNaN(parseInt(id))) {
+    return res.status(400).json({ error: 'Bad Request', message: 'Question ID must be a number.' });
+  }
+
+  try {
+    const questionRow = await loadQuestionById(id);
+
+    if (!questionRow) {
+      return res.status(404).json({ error: 'Not Found', message: `Question with ID ${id} not found.` });
+    }
+
+    const question = formatQuestion(questionRow);
+
+    return res.status(200).json(buildQuestionResponse(question));
+  } catch (err) {
+    console.error('[getQuestionById]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+// ────────────────────────────────────────────────────────────
+// PUT /questions/:id  (Admin only)
+// - New image files are uploaded to S3 and appended
+// - existingImageUrls (JSON array string) specifies which old
+//   URLs to keep — any not included are deleted from S3
+// ────────────────────────────────────────────────────────────
+const updateQuestion = async (req, res) => {
+  const { id } = req.params;
+
+  if (isNaN(parseInt(id))) {
+    return res.status(400).json({ error: 'Bad Request', message: 'Question ID must be a number.' });
+  }
+
+  const {
+    title,
+    description,
+    constraints,
+    leetcodeLink,
+    difficulty,
+  } = req.body;
+
+  // Parse optional array fields
+  let topics, testCases, existingImageUrls;
+  try {
+    if (req.body.topics !== undefined) {
+      topics = typeof req.body.topics === 'string' ? JSON.parse(req.body.topics) : req.body.topics;
+    }
+    if (req.body.testCases !== undefined) {
+      testCases = typeof req.body.testCases === 'string' ? JSON.parse(req.body.testCases) : req.body.testCases;
+    }
+    // existingImageUrls = URLs the admin wants to KEEP from the current set
+    if (req.body.existingImageUrls !== undefined) {
+      existingImageUrls = typeof req.body.existingImageUrls === 'string'
+        ? JSON.parse(req.body.existingImageUrls)
+        : req.body.existingImageUrls;
+    }
+  } catch {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: 'topics, testCases, and existingImageUrls must be valid JSON arrays.',
+    });
+  }
+
+  // Validate fields if they are provided
+  if (difficulty) {
+    if (!VALID_DIFFICULTIES.includes(difficulty)) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
+      });
+    }
+  }
+
+  if (topics !== undefined && (!Array.isArray(topics) || topics.length === 0)) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: 'topics must be a non-empty array.',
+    });
+  }
+
+  if (testCases !== undefined && (!Array.isArray(testCases) || testCases.length === 0)) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: 'testCases must be a non-empty array.',
+    });
+  }
+
+  if (existingImageUrls !== undefined && !Array.isArray(existingImageUrls)) {
+    return res.status(400).json({
+      error: 'Validation Error',
+      message: 'existingImageUrls must be an array.',
+    });
+  }
+
+  try {
+    const current = await loadQuestionById(id);
+    if (!current) {
+      return res.status(404).json({ error: 'Not Found', message: `Question with ID ${id} not found.` });
+    }
+
+    const expectedQuestionVersion = getExpectedQuestionVersion(req);
+    if (!expectedQuestionVersion) {
+      return sendMissingQuestionVersionResponse(res);
+    }
+
+    if (!matchesQuestionVersion(current.updated_at, expectedQuestionVersion)) {
+      return sendQuestionVersionConflictResponse(res, current, formatQuestion);
+    }
+
+    const finalTitle = title ?? current.title;
+    const finalDescription = description ?? current.description;
+    const finalConstraints = constraints !== undefined ? constraints : current.constraints;
+    const finalTestCases = testCases ? JSON.stringify(testCases) : current.test_cases;
+    const finalLeetcodeLink = leetcodeLink !== undefined ? leetcodeLink : current.leetcode_link;
+    const finalDifficulty = difficulty ?? current.difficulty;
+    const finalTopics = topics ?? current.topics;
+
+    const missingFinalFields = [];
+    if (isBlank(finalTitle)) missingFinalFields.push('title');
+    if (isBlank(finalDescription)) missingFinalFields.push('description');
+    if (isBlank(finalDifficulty)) missingFinalFields.push('difficulty');
+    if (isBlank(finalLeetcodeLink)) missingFinalFields.push('leetcodeLink');
+
+    if (missingFinalFields.length > 0) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: 'The following required fields are missing or invalid.',
+        missingFields: missingFinalFields,
+      });
+    }
+
+    if (!VALID_DIFFICULTIES.includes(finalDifficulty)) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: `difficulty must be one of: ${VALID_DIFFICULTIES.join(', ')}`,
+      });
+    }
+
+    const duplicateQuestion = await findDuplicateQuestion({
+      title: finalTitle,
+      leetcodeLink: finalLeetcodeLink,
+      excludeQuestionId: current.question_id,
+    });
+
+    if (duplicateQuestion) {
+      return sendDuplicateResponse(res, duplicateQuestion);
+    }
+
+    // ── Image handling ───────────────────────────────────────
+    // 1. Upload any new image files to S3
+    let newlyUploadedUrls = [];
+    try {
+      newlyUploadedUrls = await handleImageUploads(req.files);
+    } catch (err) {
+      return res.status(400).json({ error: 'Validation Error', message: err.message });
+    }
+ 
+    // 2. Determine final image_urls for the DB
+    let finalImageUrls;
+    let removedUrls = [];
+    const currentImageUrls = Array.isArray(current.image_urls) ? current.image_urls : [];
+    if (existingImageUrls !== undefined) {
+      // Admin explicitly specified which old URLs to keep
+      removedUrls = currentImageUrls.filter(url => !existingImageUrls.includes(url));
+      // Final = kept old URLs + newly uploaded URLs
+      finalImageUrls = [...existingImageUrls, ...newlyUploadedUrls];
+    } else if (newlyUploadedUrls.length > 0) {
+      // No existingImageUrls specified — just append new uploads to existing
+      finalImageUrls = [...currentImageUrls, ...newlyUploadedUrls];
+    } else {
+      // No image changes at all — keep existing
+      finalImageUrls = currentImageUrls;
+    }
+
+    let result;
+    try {
+      result = await pool.query(
+        `UPDATE questions SET
+           title         = $1,
+           description   = $2,
+           constraints   = $3,
+           test_cases    = $4,
+           leetcode_link = $5,
+           difficulty    = $6,
+           topics        = $7,
+           image_urls    = $8,
+           updated_at    = NOW()
+         WHERE question_id = $9
+           AND ${buildQuestionVersionMatchExpression('updated_at', '$10')}
+         RETURNING *`,
+        [
+          finalTitle,
+          finalDescription,
+          finalConstraints,
+          finalTestCases,
+          finalLeetcodeLink,
+          finalDifficulty,
+          finalTopics,
+          finalImageUrls,
+          id,
+          expectedQuestionVersion.timestampMs,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        if (newlyUploadedUrls.length > 0) {
+          await deleteImages(newlyUploadedUrls).catch(e => console.error('[updateQuestion] new image cleanup failed:', e));
+        }
+        return resolveQuestionWriteConflict(id, res);
+      }
+    } catch (err) {
+      if (newlyUploadedUrls.length > 0) {
+        await deleteImages(newlyUploadedUrls).catch(e => console.error('[updateQuestion] new image cleanup failed:', e));
+      }
+      if (isQuestionUniqueViolation(err)) {
+        const duplicateQuestion = await findDuplicateQuestion({
+          title: finalTitle,
+          leetcodeLink: finalLeetcodeLink,
+          excludeQuestionId: current.question_id,
+        }).catch(e => {
+          console.error('[updateQuestion] duplicate lookup after unique violation failed:', e);
+          return null;
+        });
+        if (duplicateQuestion) {
+          return sendDuplicateResponse(res, duplicateQuestion);
+        }
+        return res.status(409).json(buildUniqueViolationResponse(err));
+      }
+      throw err;
+    }
+
+    if (removedUrls.length > 0) {
+      await deleteImages(removedUrls).catch(e => console.error('[updateQuestion] S3 delete failed:', e));
+    }
+
+    return res.status(200).json({
+      message: 'Question updated successfully.',
+      question: formatQuestion(result.rows[0]),
+    });
+  } catch (err) {
+    console.error('[updateQuestion]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+// ────────────────────────────────────────────────────────────
+// DELETE /questions/:id  (Admin only)
+// Deletes the question AND all its S3 images
+// ────────────────────────────────────────────────────────────
+const deleteQuestion = async (req, res) => {
+  const { id } = req.params;
+
+  if (isNaN(parseInt(id))) {
+    return res.status(400).json({ error: 'Bad Request', message: 'Question ID must be a number.' });
+  }
+
+  try {
+    const current = await loadQuestionById(id);
+    if (!current) {
+      return res.status(404).json({ error: 'Not Found', message: `Question with ID ${id} not found.` });
+    }
+
+    const expectedQuestionVersion = getExpectedQuestionVersion(req);
+    if (!expectedQuestionVersion) {
+      return sendMissingQuestionVersionResponse(res);
+    }
+
+    if (!matchesQuestionVersion(current.updated_at, expectedQuestionVersion)) {
+      return sendQuestionVersionConflictResponse(res, current, formatQuestion);
+    }
+
+    const deleteResult = await pool.query(
+      `DELETE FROM questions
+       WHERE question_id = $1
+         AND ${buildQuestionVersionMatchExpression('updated_at', '$2')}
+       RETURNING title, image_urls`,
+      [id, expectedQuestionVersion.timestampMs]
+    );
+
+    if (deleteResult.rows.length === 0) {
+      return resolveQuestionWriteConflict(id, res);
+    }
+
+    const deletedQuestion = deleteResult.rows[0];
+    const deletedImageUrls = Array.isArray(deletedQuestion.image_urls) ? deletedQuestion.image_urls : [];
+    if (deletedImageUrls.length > 0) {
+      await deleteImages(deletedImageUrls).catch(e => console.error('[deleteQuestion] S3 cleanup failed:', e));
+    }
+
+    return res.status(200).json({
+      message: `Question "${deletedQuestion.title}" (ID: ${id}) and ${deletedImageUrls.length} image(s) deleted successfully.`,
+    });
+  } catch (err) {
+    console.error('[deleteQuestion]', err);
+    return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  }
+};
+
+export {
+  createQuestion,
+  getQuestions,
+  getTopics,
+  getRandomQuestion,
+  getQuestionById,
+  updateQuestion,
+  deleteQuestion,
+  formatQuestion,
+};

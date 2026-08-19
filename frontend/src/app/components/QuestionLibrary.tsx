@@ -1,0 +1,530 @@
+import { useDeferredValue, useEffect, useRef, useState } from "react";
+import { Badge } from "@/app/components/ui/badge";
+import { Button } from "@/app/components/ui/button";
+import { Input } from "@/app/components/ui/input";
+import { Label } from "@/app/components/ui/label";
+import {
+  Pagination,
+  PaginationContent,
+  PaginationEllipsis,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/app/components/ui/pagination";
+import {
+  BookOpen,
+  Edit,
+  Grid3x3,
+  Image as ImageIcon,
+  List,
+  Plus,
+  Search,
+  Shield,
+  Trash2,
+  User,
+} from "lucide-react";
+import { deleteQuestion, getQuestions, getQuestionVersionConflictData, getTopics, type Question } from "@/app/services/questionService";
+import { extractApiErrorMessage } from "../utils/apiError";
+
+interface QuestionLibraryProps {
+  onStartSession?: () => void;
+  onNavigateToAddQuestion?: () => void;
+  onNavigateToEditQuestion?: (question: Question) => void;
+}
+
+const DEFAULT_PAGE_SIZE = 12;
+
+const buildPaginationItems = (currentPage: number, totalPages: number) => {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, index) => index + 1);
+  }
+
+  if (currentPage <= 4) {
+    return [1, 2, 3, 4, 5, "ellipsis", totalPages];
+  }
+
+  if (currentPage >= totalPages - 3) {
+    return [1, "ellipsis", totalPages - 4, totalPages - 3, totalPages - 2, totalPages - 1, totalPages];
+  }
+
+  return [1, "ellipsis", currentPage - 1, currentPage, currentPage + 1, "ellipsis", totalPages];
+};
+
+export function QuestionLibrary({
+  onNavigateToAddQuestion,
+  onNavigateToEditQuestion,
+}: QuestionLibraryProps) {
+  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [availableTopics, setAvailableTopics] = useState<string[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [topicFilter, setTopicFilter] = useState("");
+  const [difficultyFilter, setDifficultyFilter] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [totalCount, setTotalCount] = useState(0);
+  const [totalPages, setTotalPages] = useState(0);
+  const deferredSearchQuery = useDeferredValue(searchQuery.trim());
+  const previousFilterKeyRef = useRef("");
+
+  const fetchQuestions = async () => {
+    setIsLoading(true);
+    setError("");
+
+    try {
+      const filters: {
+        topics?: string[];
+        difficulty?: string;
+        search?: string;
+        page?: number;
+        pageSize?: number;
+      } = {
+        page: currentPage,
+        pageSize,
+      };
+
+      if (topicFilter) {
+        filters.topics = [topicFilter];
+      }
+
+      if (difficultyFilter) {
+        filters.difficulty = difficultyFilter;
+      }
+
+      if (deferredSearchQuery) {
+        filters.search = deferredSearchQuery;
+      }
+
+      const data = await getQuestions(filters);
+      setQuestions(data.questions);
+      setTotalCount(data.totalCount);
+      setTotalPages(data.totalPages);
+
+      if (data.page !== currentPage) {
+        setCurrentPage(data.page);
+      }
+    } catch (err: unknown) {
+      setError(extractApiErrorMessage(err, "Failed to load questions"));
+      setQuestions([]);
+      setTotalCount(0);
+      setTotalPages(0);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const fetchTopics = async () => {
+    try {
+      const data = await getTopics();
+      setAvailableTopics(data.topics);
+    } catch (err: unknown) {
+      setError(extractApiErrorMessage(err, "Failed to load topics"));
+    }
+  };
+
+  useEffect(() => {
+    fetchTopics();
+  }, []);
+
+  useEffect(() => {
+    const filterKey = [topicFilter, difficultyFilter, deferredSearchQuery, pageSize].join("|");
+    if (previousFilterKeyRef.current !== filterKey) {
+      previousFilterKeyRef.current = filterKey;
+
+      if (currentPage !== 1) {
+        setCurrentPage(1);
+        return;
+      }
+    }
+
+    fetchQuestions();
+  }, [topicFilter, difficultyFilter, deferredSearchQuery, currentPage, pageSize]);
+
+  const handleDelete = async (question: Question) => {
+    try {
+      await deleteQuestion(question.questionId, question.updatedAt);
+      await fetchQuestions();
+    } catch (err: unknown) {
+      const conflictData = getQuestionVersionConflictData(err);
+      if (conflictData) {
+        await fetchQuestions();
+        setError("This question changed before it could be deleted. The library has been refreshed.");
+        return;
+      }
+
+      setError(extractApiErrorMessage(err, "Failed to delete question"));
+    }
+  };
+
+  const getDifficultyColor = (difficulty: string) => {
+    switch (difficulty) {
+      case "Easy":
+        return "bg-green-100 text-green-800 border-green-300";
+      case "Medium":
+        return "bg-yellow-100 text-yellow-800 border-yellow-300";
+      case "Hard":
+        return "bg-red-100 text-red-800 border-red-300";
+      default:
+        return "bg-gray-100 text-gray-800 border-gray-300";
+    }
+  };
+
+  const paginationItems = buildPaginationItems(currentPage, totalPages);
+  const startItem = totalCount === 0 ? 0 : (currentPage - 1) * pageSize + 1;
+  const endItem = totalCount === 0 ? 0 : startItem + questions.length - 1;
+
+  return (
+    <div className="space-y-6">
+      {/* Admin Header Banner */}
+      <div className="bg-gradient-to-r from-purple-600 to-indigo-600 rounded-lg p-4 text-white shadow-lg">
+        <div className="flex items-center justify-between flex-wrap gap-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-white/20 rounded-lg flex items-center justify-center backdrop-blur-sm">
+              <Shield className="w-5 h-5" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold">Question Library</h1>
+              <p className="text-purple-100 text-sm">Admin Management Portal</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <Badge className="bg-white/20 text-white border-white/30 px-3 py-1.5 backdrop-blur-sm">
+              <User className="w-3 h-3 mr-1.5" />
+              Admin Access
+            </Badge>
+            <Button className="bg-white text-purple-600 hover:bg-purple-50 h-10" onClick={onNavigateToAddQuestion}>
+              <Plus className="mr-2 h-4 w-4" />
+              Add New Question
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {/* Filters and Controls */}
+      <div className="border-4 border-gray-300 rounded-lg p-5 bg-white">
+        <div className="flex flex-col lg:flex-row gap-4">
+          {/* Search */}
+          <div className="flex-1">
+            <Label htmlFor="search" className="text-gray-700 mb-2 block">
+              Search Questions
+            </Label>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+              <Input
+                id="search"
+                placeholder="Search by title, description, or topic..."
+                className="pl-10 border-2 border-gray-300"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+            </div>
+          </div>
+
+          {/* Topic Filter */}
+          <div className="w-full lg:w-48">
+            <Label htmlFor="topic-filter" className="text-gray-700 mb-2 block">
+              Topic
+            </Label>
+            <select
+              id="topic-filter"
+              className="w-full h-10 px-3 border-2 border-gray-300 rounded-md bg-white"
+              value={topicFilter}
+              onChange={(e) => setTopicFilter(e.target.value)}
+            >
+              <option value="">All Topics</option>
+              {availableTopics.map((topic) => (
+                <option key={topic} value={topic}>
+                  {topic}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Difficulty Filter */}
+          <div className="w-full lg:w-48">
+            <Label htmlFor="difficulty-filter" className="text-gray-700 mb-2 block">
+              Difficulty
+            </Label>
+            <select
+              id="difficulty-filter"
+              className="w-full h-10 px-3 border-2 border-gray-300 rounded-md bg-white"
+              value={difficultyFilter}
+              onChange={(e) => setDifficultyFilter(e.target.value)}
+            >
+              <option value="">All Levels</option>
+              <option value="Easy">Easy</option>
+              <option value="Medium">Medium</option>
+              <option value="Hard">Hard</option>
+            </select>
+          </div>
+
+          <div className="w-full lg:w-36">
+            <Label htmlFor="page-size" className="text-gray-700 mb-2 block">
+              Per Page
+            </Label>
+            <select
+              id="page-size"
+              className="w-full h-10 px-3 border-2 border-gray-300 rounded-md bg-white"
+              value={pageSize}
+              onChange={(e) => setPageSize(Number(e.target.value))}
+            >
+              <option value={12}>12</option>
+              <option value={24}>24</option>
+              <option value={48}>48</option>
+            </select>
+          </div>
+
+          {/* View Toggle */}
+          <div className="w-full lg:w-auto">
+            <Label className="text-gray-700 mb-2 block">View</Label>
+            <div className="flex gap-2">
+              <Button
+                variant={viewMode === "grid" ? "default" : "outline"}
+                size="sm"
+                onClick={() => setViewMode("grid")}
+                className={viewMode === "grid" ? "bg-blue-600" : "border-2 border-gray-300"}
+              >
+                <Grid3x3 className="h-4 w-4" />
+              </Button>
+              <Button
+                variant={viewMode === "list" ? "default" : "outline"}
+                size="sm"
+                onClick={() => setViewMode("list")}
+                className={viewMode === "list" ? "bg-blue-600" : "border-2 border-gray-300"}
+              >
+                <List className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-sm text-gray-600">
+          <p>
+            {isLoading
+              ? "Loading questions..."
+              : totalCount === 0
+                ? "No questions found."
+                : `Showing ${startItem}-${endItem} of ${totalCount} questions`}
+          </p>
+          {deferredSearchQuery && (
+            <p>
+              Search results for <span className="font-medium text-gray-800">"{deferredSearchQuery}"</span>
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* Questions Display */}
+      {isLoading ? (
+        <div className="text-center py-12 text-gray-500">Loading questions...</div>
+      ) : error ? (
+        <div className="text-center py-12 text-red-600">{error}</div>
+      ) : questions.length === 0 ? (
+        <div className="border-4 border-dashed border-gray-300 rounded-lg p-12 bg-white text-center text-gray-500">
+          No questions match the current filters.
+        </div>
+      ) : viewMode === "grid" ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {questions.map((question, idx) => {
+            const questionNumber = (currentPage - 1) * pageSize + idx + 1;
+
+            return (
+              <div
+                key={question.questionId}
+                className="border-4 border-gray-300 rounded-lg p-5 bg-white hover:border-blue-400 transition-colors cursor-pointer group"
+              >
+                <div className="space-y-3">
+                  {/* Header */}
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Badge variant="outline" className="text-xs font-mono border-gray-400 text-gray-600">
+                          Q{String(questionNumber).padStart(3, "0")}
+                        </Badge>
+                      </div>
+                      <h3 className="font-semibold text-gray-900">{question.title}</h3>
+                    </div>
+                    {question.imageUrls && question.imageUrls.length > 0 && (
+                      <div className="flex-shrink-0 p-1 border-2 border-gray-300 rounded">
+                        <ImageIcon className="h-4 w-4 text-gray-400" />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Tags */}
+                  <div className="flex flex-wrap gap-2">
+                    <Badge className={`border ${getDifficultyColor(question.difficulty)}`}>
+                      {question.difficulty}
+                    </Badge>
+                    {question.topics.map((topic) => (
+                      <Badge key={topic} variant="secondary" className="border border-gray-300">
+                        {topic}
+                      </Badge>
+                    ))}
+                  </div>
+
+                  {/* Description */}
+                  <p className="text-sm text-gray-600 line-clamp-2">{question.description}</p>
+
+                  {/* Leetcode Link */}
+                  {question.leetcodeLink && (
+                    <div className="flex items-center gap-2 text-xs text-blue-600">
+                      <a href={question.leetcodeLink} target="_blank" rel="noopener noreferrer" className="hover:underline">
+                        LeetCode Link
+                      </a>
+                    </div>
+                  )}
+
+                  {/* Admin Action Buttons */}
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="flex-1 border-2 border-blue-300 text-blue-700 hover:bg-blue-50 hover:border-blue-400"
+                      onClick={() => onNavigateToEditQuestion && onNavigateToEditQuestion(question)}
+                    >
+                      <Edit className="mr-1 h-3 w-3" />
+                      Edit
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleDelete(question)}
+                      className="flex-1 border-2 border-red-300 text-red-700 hover:bg-red-50 hover:border-red-400"
+                    >
+                      <Trash2 className="mr-1 h-3 w-3" />
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {questions.map((question, idx) => {
+            const questionNumber = (currentPage - 1) * pageSize + idx + 1;
+
+            return (
+              <div
+                key={question.questionId}
+                className="border-4 border-gray-300 rounded-lg p-5 bg-white hover:border-blue-400 transition-colors cursor-pointer group"
+              >
+                <div className="flex items-center gap-4">
+                  {/* Image Indicator */}
+                  <div className="w-16 h-16 border-2 border-gray-300 rounded-lg flex items-center justify-center bg-gray-50 flex-shrink-0">
+                    {question.imageUrls && question.imageUrls.length > 0 ? (
+                      <ImageIcon className="h-8 w-8 text-gray-400" />
+                    ) : (
+                      <BookOpen className="h-8 w-8 text-gray-400" />
+                    )}
+                  </div>
+
+                  {/* Content */}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <Badge variant="outline" className="text-xs font-mono border-gray-400 text-gray-600">
+                        Q{String(questionNumber).padStart(3, "0")}
+                      </Badge>
+                      <h3 className="font-semibold text-gray-900">{question.title}</h3>
+                    </div>
+                    <p className="text-sm text-gray-600 mb-2">{question.description}</p>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge className={`border text-xs ${getDifficultyColor(question.difficulty)}`}>
+                        {question.difficulty}
+                      </Badge>
+                      {question.topics.map((topic) => (
+                        <Badge key={topic} variant="secondary" className="border border-gray-300 text-xs">
+                          {topic}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Admin Action Buttons */}
+                  <div className="flex gap-2 flex-shrink-0">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="border-2 border-blue-300 text-blue-700 hover:bg-blue-50 hover:border-blue-400"
+                      onClick={() => onNavigateToEditQuestion && onNavigateToEditQuestion(question)}
+                    >
+                      <Edit className="mr-1 h-4 w-4" />
+                      Edit
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleDelete(question)}
+                      className="border-2 border-red-300 text-red-700 hover:bg-red-50 hover:border-red-400"
+                    >
+                      <Trash2 className="mr-1 h-4 w-4" />
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {totalPages > 1 && (
+        <Pagination>
+          <PaginationContent>
+            <PaginationItem>
+              <PaginationPrevious
+                href="#"
+                onClick={(event) => {
+                  event.preventDefault();
+                  if (currentPage > 1) {
+                    setCurrentPage((page) => page - 1);
+                  }
+                }}
+                className={currentPage <= 1 ? "pointer-events-none opacity-50" : ""}
+              />
+            </PaginationItem>
+
+            {paginationItems.map((item, index) => (
+              <PaginationItem key={`${item}-${index}`}>
+                {item === "ellipsis" ? (
+                  <PaginationEllipsis />
+                ) : (
+                  <PaginationLink
+                    href="#"
+                    isActive={item === currentPage}
+                    onClick={(event) => {
+                      if (typeof item === "number") {
+                        event.preventDefault();
+                        setCurrentPage(item);
+                      }
+                    }}
+                  >
+                    {item}
+                  </PaginationLink>
+                )}
+              </PaginationItem>
+            ))}
+
+            <PaginationItem>
+              <PaginationNext
+                href="#"
+                onClick={(event) => {
+                  event.preventDefault();
+                  if (currentPage < totalPages) {
+                    setCurrentPage((page) => page + 1);
+                  }
+                }}
+                className={currentPage >= totalPages ? "pointer-events-none opacity-50" : ""}
+              />
+            </PaginationItem>
+          </PaginationContent>
+        </Pagination>
+      )}
+    </div>
+  );
+}

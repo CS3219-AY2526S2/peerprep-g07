@@ -1,0 +1,236 @@
+services:
+  user-service:
+    build: ./user-service
+    container_name: user-service
+    environment:
+      - PORT=${USER_SERVICE_PORT}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${USER_DB_NAME}
+      - JWT_SECRET=${JWT_SECRET}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+    restart: unless-stopped
+
+  question-service:
+    build: ./question-service
+    container_name: question-service
+    environment:
+      - PORT=${QUESTION_SERVICE_PORT}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${QUESTION_DB_NAME}
+      - USER_SERVICE_URL=${USER_SERVICE_URL}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - LEETCODE_API_URL=${LEETCODE_API_URL}
+      - LEETCODE_SYNC_CRON=${LEETCODE_SYNC_CRON}
+      - LEETCODE_FETCH_LIMIT=${LEETCODE_FETCH_LIMIT}
+      - LEETCODE_REQUEST_DELAY_MS=${LEETCODE_REQUEST_DELAY_MS}
+      - LEETCODE_MAX_RETRIES=${LEETCODE_MAX_RETRIES}
+      - LEETCODE_RETRY_DELAY_MS=${LEETCODE_RETRY_DELAY_MS}
+      - LEETCODE_RUN_ON_START=${LEETCODE_RUN_ON_START}
+      - LEETCODE_BATCH_SIZE=${LEETCODE_BATCH_SIZE}
+      - LEETCODE_RATE_LIMIT_DELAY_MS=${LEETCODE_RATE_LIMIT_DELAY_MS}
+    depends_on:
+      leetcode-api:
+        condition: service_started
+    restart: unless-stopped
+
+  attempt-history-service:
+    build: ./attempt-history-service
+    container_name: attempt-history-service
+    environment:
+      - PORT=${ATTEMPT_HISTORY_SERVICE_PORT}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${ATTEMPT_HISTORY_DB_NAME}
+      - DB_BOOTSTRAP_DB=${ATTEMPT_HISTORY_BOOTSTRAP_DB}
+      - JWT_SECRET=${JWT_SECRET}
+      - QUESTION_SERVICE_URL=http://question-service:${QUESTION_SERVICE_PORT}
+    depends_on:
+      - question-service
+    restart: unless-stopped
+
+  leetcode-api:
+    image: alfaarghya/alfa-leetcode-api:2.0.3
+    container_name: leetcode-api
+    restart: unless-stopped
+
+  matching-service:
+    build: ./matching-service
+    container_name: matching-service
+    environment:
+      PORT: ${MATCHING_SERVICE_PORT}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      COLLAB_REDIS_URL: redis://collab-redis:6379
+      QUESTION_SERVICE_URL: http://question-service:${QUESTION_SERVICE_PORT}
+    depends_on:
+      redis:
+        condition: service_healthy
+      collab-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  collab-redis:
+    image: redis:7-alpine
+    container_name: collab-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  collaboration-service:
+    build: ./collaboration-service
+    container_name: collaboration-service
+    environment:
+      - PORT=${COLLAB_SERVICE_PORT}
+      - REDIS_URL=redis://collab-redis:6379
+      - QUESTION_SERVICE_URL=http://question-service:${QUESTION_SERVICE_PORT}
+    depends_on:
+      collab-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  piston:
+    image: ghcr.io/engineer-man/piston:latest
+    container_name: piston
+    privileged: true
+    volumes:
+      - piston-data:/piston
+    tmpfs:
+      - /tmp:exec
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:2000/api/v2/runtimes', r => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  piston-init:
+    image: curlimages/curl:latest
+    container_name: piston-init
+    depends_on:
+      piston:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        RUNTIMES=$$(curl -s http://piston:2000/api/v2/runtimes)
+        is_installed() {
+          lang=$$1; ver=$$2
+          echo "$$RUNTIMES" | grep -q "\"language\":\"$$lang\"" && \
+          echo "$$RUNTIMES" | grep -q "\"version\":\"$$ver\"" && return 0
+          return 1
+        }
+        install_pkg() {
+          pkg=$$1; lang=$$2; ver=$$3
+          if is_installed "$$lang" "$$ver"; then
+            echo "$$lang-$$ver already installed, skipping"
+            return 0
+          fi
+          for attempt in 1 2 3; do
+            echo "Installing $$lang-$$ver (attempt $$attempt/3)..."
+            result=$$(curl -s --max-time 300 --connect-timeout 10 -w "\n%{http_code}" -X POST http://piston:2000/api/v2/packages \
+              -H "Content-Type: application/json" -d "$$pkg")
+            http_code=$$(echo "$$result" | tail -1)
+            body=$$(echo "$$result" | sed '$$d')
+            if [ "$$http_code" = "200" ]; then
+              echo " OK"
+              return 0
+            elif echo "$$body" | grep -qi "already installed"; then
+              echo " Already installed, skipping"
+              return 0
+            fi
+            echo " Failed (HTTP $$http_code), retrying in 10s..."
+            sleep 10
+          done
+          echo " FAILED after 3 attempts: $$lang-$$ver"
+          return 1
+        }
+        install_pkg '{"language":"python","version":"3.10.0"}' python 3.10.0
+        install_pkg '{"language":"node","version":"18.15.0"}' node 18.15.0
+        install_pkg '{"language":"typescript","version":"5.0.3"}' typescript 5.0.3
+        install_pkg '{"language":"java","version":"15.0.2"}' java 15.0.2
+        install_pkg '{"language":"gcc","version":"10.2.0"}' gcc 10.2.0
+        install_pkg '{"language":"go","version":"1.16.2"}' go 1.16.2
+        install_pkg '{"language":"ruby","version":"3.0.1"}' ruby 3.0.1
+        install_pkg '{"language":"mono","version":"6.12.0"}' mono 6.12.0
+        echo "All runtimes installed."
+    restart: "no"
+
+  code-execution-service:
+    build: ./code-execution-service
+    container_name: code-execution-service
+    environment:
+      - PORT=${CODE_EXECUTION_PORT}
+      - PISTON_URL=http://piston:2000
+    depends_on:
+      piston-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  api-gateway:
+    build: ./api-gateway
+    container_name: api-gateway
+    environment:
+      - PORT=${GATEWAY_PORT}
+      - USER_SERVICE_URL=${USER_SERVICE_URL}
+      - QUESTION_SERVICE_URL=${QUESTION_SERVICE_URL}
+      - ATTEMPT_HISTORY_SERVICE_URL=${ATTEMPT_HISTORY_SERVICE_URL}
+      - MATCHING_SERVICE_URL=${MATCHING_SERVICE_URL}
+      - COLLAB_SERVICE_URL=${COLLAB_SERVICE_URL}
+      - COLLAB_WS_URL=${COLLAB_WS_URL}
+      - CODE_EXECUTION_SERVICE_URL=${CODE_EXECUTION_SERVICE_URL}
+      - JWT_SECRET=${JWT_SECRET}
+    ports:
+      - "${GATEWAY_PORT}:${GATEWAY_PORT}"
+    depends_on:
+      - matching-service
+      - collaboration-service
+      - attempt-history-service
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${GATEWAY_URL}
+        VITE_YJS_WS_URL: ${COLLAB_YJS_WS_URL}
+        VITE_CHAT_WS_URL: ${COLLAB_CHAT_WS_URL}
+    container_name: frontend
+    ports:
+      - "80:${FRONTEND_PORT}"
+    depends_on:
+      - api-gateway
+    restart: unless-stopped
+
+volumes:
+  piston-data:
